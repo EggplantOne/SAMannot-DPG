@@ -1,0 +1,25 @@
+numpy>=1.22.0
+pillow>=9.0.0
+opencv-python>=4.7.0
+matplotlib>=3.5.0
+
+# PyTorch and computer vision
+torch>=2.0.0
+torchvision>=0.15.0
+timm>=0.6.12
+
+# SAM2 specific requirements
+segment-anything
+omegaconf>=2.3.0
+supervision>=0.13.0
+pycocotools>=2.0.6
+iopath>=0.1.10
+
+# GUI
+dearpygui>=2.0
+
+# misc
+hydra-core
+psutil
+scikit-image
+imageio-ffmpeg
