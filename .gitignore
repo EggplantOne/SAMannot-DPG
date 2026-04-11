@@ -9,3 +9,8 @@ checkpoints/
 *.mov
 *.mkv
 .sam_temp/
+.claude/
+label_presets.json
+*.jpg
+*.png
+*.bmp

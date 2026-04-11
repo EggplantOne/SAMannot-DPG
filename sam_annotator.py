@@ -16,7 +16,7 @@ class SAM_Annotator:
         self.ckpt_path = ckpt_path
         self.model_cfg_path = model_cfg_path
         self.labels = []
-        self.object_id_to_label_name = {}
+        self.object_id_to_group_id = {}
         self.blocking_frames = []
         self.current_block = 0
         self.media_files = []
@@ -114,11 +114,12 @@ class SAM_Annotator:
         pt_labels = np.array(pt_labels)
         boxes = np.array(boxes)
         return pt_coords, pt_labels, boxes, most_recent_prompt, most_recent_prompt_box
-    def _get_object_id_for_label(self, label_name):
-        if (label_name + str(self.current_block)) not in self.object_ids:
-            self.object_ids[(label_name + str(self.current_block))] = len(self.object_ids) + 1
-            self.object_id_to_label_name[self.object_ids[(label_name + str(self.current_block))]] = label_name
-        return self.object_ids[(label_name + str(self.current_block))]
+    def _get_object_id(self, group_id):
+        key = (group_id, self.current_block)
+        if key not in self.object_ids:
+            self.object_ids[key] = len(self.object_ids) + 1
+            self.object_id_to_group_id[self.object_ids[key]] = group_id
+        return self.object_ids[key]
     def init_inference_state(self, path, status_callback=None):
         if not self.model_loaded:
             return False
@@ -132,8 +133,20 @@ class SAM_Annotator:
             if status_callback:
                 status_callback(f"Error initializing SAM2 tracking: {str(e)}")
             return False
+    def _find_nearest_prompt_frame(self, frame_idx):
+        """Find the nearest prompt frame <= frame_idx. Returns None if no prompt exists."""
+        all_prompt_frames = set()
+        for label in self.labels:
+            for pt in label.pts.get(self.current_block, []):
+                all_prompt_frames.add(pt.idx)
+            for box in label.boxes.get(self.current_block, []):
+                all_prompt_frames.add(box.idx)
+        candidates = [f for f in all_prompt_frames if f <= frame_idx]
+        return max(candidates) if candidates else None
+
+    @torch.inference_mode()
     def generate_mask_for_frame(self, idx, flag=0):
-        """Single frame mask generation using SAM2ImagePredictor (faster, no video context needed)."""
+        """Single frame mask generation using SAM2ImagePredictor."""
         if not self.model_loaded:
             print("[SAM] model not loaded")
             return {}
@@ -147,7 +160,6 @@ class SAM_Annotator:
 
             with torch.autocast(self.device.type, dtype=torch.float16):
                 self.image_predictor.set_image(image_rgb)
-
                 results = {}
                 frame_results = {}
                 for label in self.labels:
@@ -156,16 +168,13 @@ class SAM_Annotator:
                     has_boxes = boxes.shape[0] != 0
                     if not has_pts and not has_boxes:
                         continue
-
                     masks, scores, _ = self.image_predictor.predict(
                         point_coords=pt_coords if has_pts else None,
                         point_labels=pt_labels if has_pts else None,
                         box=boxes[0] if has_boxes else None,
                         multimask_output=False,
                     )
-                    # masks shape: (1, H, W), take first
-                    frame_results[label.name] = masks[:1]  # keep (1, H, W) shape
-
+                    frame_results[label.group_id] = masks[:1]
                 if not frame_results:
                     return {}
                 results[idx] = frame_results
@@ -174,47 +183,77 @@ class SAM_Annotator:
             print(f"Error generating mask: {str(e)}")
             import traceback; traceback.print_exc()
             return {}
+    @torch.inference_mode()
     def propagate(self, direction, start_frame_idx, end_frame_idx = None, progress_callback = None, flag = 1):
         if not self.tracking_init:
             print("Tracking not initialized!")
             return {}
         try:
             self.predictor.reset_state(self.inference_state)
-            # add ALL prompts from all frames in the current block
             with torch.autocast(self.device.type, dtype=torch.float16):
-                for label in self.labels:
-                    obj_id = self._get_object_id_for_label(label.name)
-                    # collect all prompt frame indices for this label
-                    prompt_frames = set()
-                    for pt in label.pts.get(self.current_block, []):
-                        prompt_frames.add(pt.idx)
-                    for box in label.boxes.get(self.current_block, []):
-                        prompt_frames.add(box.idx)
-                    # add prompts at each frame
-                    for f_idx in sorted(prompt_frames):
+                if direction == -1:
+                    # backward: only use prompts from the nearest prompt frame (<= start_frame_idx)
+                    prompt_frame = self._find_nearest_prompt_frame(start_frame_idx)
+                    if prompt_frame is None:
+                        return {}
+                    for label in self.labels:
+                        obj_id = self._get_object_id(label.group_id)
                         pts = []
                         lbls = []
                         for pt in label.pts.get(self.current_block, []):
-                            if pt.idx == f_idx:
+                            if pt.idx == prompt_frame:
                                 pts.append([pt.x, pt.y])
                                 lbls.append(pt.pt_type)
                         if pts:
                             self.predictor.add_new_points_or_box(
                                 inference_state=self.inference_state,
-                                frame_idx=f_idx,
+                                frame_idx=prompt_frame,
                                 obj_id=obj_id,
                                 points=np.array(pts),
                                 labels=np.array(lbls),
                             )
                         for box in label.boxes.get(self.current_block, []):
-                            if box.idx == f_idx:
+                            if box.idx == prompt_frame:
+                                self.predictor.add_new_points_or_box(
+                                    inference_state=self.inference_state,
+                                    frame_idx=prompt_frame,
+                                    obj_id=obj_id,
+                                    box=np.array([box.fx, box.fy, box.x, box.y]),
+                                )
+                                break
+                else:
+                    # forward: add ALL prompts from all frames in the current block
+                    for label in self.labels:
+                        obj_id = self._get_object_id(label.group_id)
+                        prompt_frames = set()
+                        for pt in label.pts.get(self.current_block, []):
+                            prompt_frames.add(pt.idx)
+                        for box in label.boxes.get(self.current_block, []):
+                            prompt_frames.add(box.idx)
+                        for f_idx in sorted(prompt_frames):
+                            pts = []
+                            lbls = []
+                            for pt in label.pts.get(self.current_block, []):
+                                if pt.idx == f_idx:
+                                    pts.append([pt.x, pt.y])
+                                    lbls.append(pt.pt_type)
+                            if pts:
                                 self.predictor.add_new_points_or_box(
                                     inference_state=self.inference_state,
                                     frame_idx=f_idx,
                                     obj_id=obj_id,
-                                    box=np.array([box.fx, box.fy, box.x, box.y]),
+                                    points=np.array(pts),
+                                    labels=np.array(lbls),
                                 )
-                                break  # only one box per frame
+                            for box in label.boxes.get(self.current_block, []):
+                                if box.idx == f_idx:
+                                    self.predictor.add_new_points_or_box(
+                                        inference_state=self.inference_state,
+                                        frame_idx=f_idx,
+                                        obj_id=obj_id,
+                                        box=np.array([box.fx, box.fy, box.x, box.y]),
+                                    )
+                                    break
             results = {}
             prop_extra_frame = True
             if direction == 1:
@@ -249,7 +288,7 @@ class SAM_Annotator:
                     masks = (out_mask_logits > 0.0).cpu().numpy()
                     frame_results = {}
                     for j, obj_id in enumerate(out_obj_ids):
-                        frame_results[self.object_id_to_label_name[obj_id]] = masks[j]
+                        frame_results[self.object_id_to_group_id[obj_id]] = masks[j]
                     results[out_frame_idx] = frame_results
                     if progress_callback:
                         progress = (i / total_prop_frames) * 100
@@ -263,6 +302,7 @@ class SAM_Annotator:
             if progress_callback:
                 progress_callback(f"Error propagating masks: {str(e)}", 0)
             return {}
+    @torch.inference_mode()
     def propagate_all_prompts(self, progress_callback=None):
         """Per-label independent propagation: each label gets its own clean inference state,
         propagated only within its own prompt range, then merged."""
@@ -273,6 +313,7 @@ class SAM_Annotator:
             total_frames = len(self.media_files)
             # Collect prompts per label
             label_prompts = {}
+            gid_to_name = {}
             for label in self.labels:
                 frames_data = {}
                 for pt in label.pts.get(self.current_block, []):
@@ -285,16 +326,18 @@ class SAM_Annotator:
                         frames_data[box.idx] = {"pts": [], "labels": [], "boxes": []}
                     frames_data[box.idx]["boxes"].append([box.fx, box.fy, box.x, box.y])
                 if frames_data:
-                    label_prompts[label.name] = frames_data
+                    label_prompts[label.group_id] = frames_data
+                    gid_to_name[label.group_id] = label.name
             if not label_prompts:
                 return {}
             # Per-label propagation, store binary masks + confidence score (saves memory)
-            label_masks = {}   # {label_name: {frame_idx: bool_ndarray}}
-            label_scores = {}  # {label_name: {frame_idx: float}} for merge priority
+            label_masks = {}   # {group_id: {frame_idx: bool_ndarray}}
+            label_scores = {}  # {group_id: {frame_idx: float}} for merge priority
             num_labels = len(label_prompts)
-            for li, (label_name, frames_data) in enumerate(label_prompts.items()):
+            for li, (group_id, frames_data) in enumerate(label_prompts.items()):
                 self.predictor.reset_state(self.inference_state)
-                obj_id = self._get_object_id_for_label(label_name)
+                obj_id = self._get_object_id(group_id)
+                label_name = gid_to_name[group_id]
                 # Add prompts — single call per frame to avoid clear_old_points overwrite
                 with torch.autocast(self.device.type, dtype=torch.float16):
                     for frame_idx in sorted(frames_data.keys()):
@@ -332,25 +375,25 @@ class SAM_Annotator:
                             if progress_callback:
                                 progress = ((li * 2 * total_frames + total_frames + i) / (num_labels * 2 * total_frames)) * 100
                                 progress_callback(f"Propagating {label_name} (backward)...", progress)
-                label_masks[label_name] = this_masks
-                label_scores[label_name] = this_scores
+                label_masks[group_id] = this_masks
+                label_scores[group_id] = this_scores
             # Merge: higher confidence label gets priority at overlapping pixels
             all_frames = set()
             for lm in label_masks.values():
                 all_frames.update(lm.keys())
             results = {}
-            label_names = list(label_masks.keys())
+            group_ids = list(label_masks.keys())
             for frame_idx in sorted(all_frames):
                 # Sort labels by confidence at this frame (highest first)
-                scored = [(label_scores[ln].get(frame_idx, -10.0), ln) for ln in label_names if frame_idx in label_masks[ln]]
+                scored = [(label_scores[gid].get(frame_idx, -10.0), gid) for gid in group_ids if frame_idx in label_masks[gid]]
                 scored.sort(reverse=True)
                 frame_results = {}
                 occupied = None
-                for _, ln in scored:
-                    mask = label_masks[ln][frame_idx]
+                for _, gid in scored:
+                    mask = label_masks[gid][frame_idx]
                     if occupied is not None:
                         mask = mask & ~occupied
-                    frame_results[ln] = mask
+                    frame_results[gid] = mask
                     if occupied is None:
                         occupied = mask.copy()
                     else:

@@ -79,7 +79,7 @@ class Annotator:
         self.media_path = "."
         self.tracking_results = {}
         self.sam_handler.labels = []
-        self.sam_handler.object_id_to_label_name = {}
+        self.sam_handler.object_id_to_group_id = {}
         self.sam_handler.object_ids = {}
         self.sam_handler.media_files = []
         self.sam_handler.propagation_blocks = {}
@@ -121,7 +121,34 @@ class Annotator:
         self.media_path = dict_representation["media_path"]
         self.video_name = dict_representation["video_name"]
         self.sam_handler.labels = dict_representation["sam_handler_labels"]
-        self.sam_handler.object_id_to_label_name = dict_representation["sam_handler_object_id_to_label_name"]
+        # migrate old pkl: assign group_id to labels that don't have one
+        if self.sam_handler.labels and not hasattr(self.sam_handler.labels[0], 'group_id'):
+            max_gid = 0
+            for lbl in self.sam_handler.labels:
+                lbl.group_id = max_gid + 1
+                max_gid = lbl.group_id
+            self.label_handler._next_group_id = max_gid + 1
+        else:
+            # update _next_group_id from loaded labels
+            max_gid = max((lbl.group_id for lbl in self.sam_handler.labels), default=0)
+            self.label_handler._next_group_id = max_gid + 1
+        # rebuild object_id_to_group_id (old pkl had object_id_to_label_name)
+        old_mapping = dict_representation.get("sam_handler_object_id_to_label_name",
+                       dict_representation.get("sam_handler_object_id_to_group_id", {}))
+        self.sam_handler.object_id_to_group_id = {}
+        # if old mapping values are strings (label names), convert to group_ids
+        if old_mapping:
+            sample_val = next(iter(old_mapping.values()))
+            if isinstance(sample_val, str):
+                name_to_gid = {}
+                for lbl in self.sam_handler.labels:
+                    if lbl.name not in name_to_gid:
+                        name_to_gid[lbl.name] = lbl.group_id
+                for obj_id, name in old_mapping.items():
+                    if name in name_to_gid:
+                        self.sam_handler.object_id_to_group_id[obj_id] = name_to_gid[name]
+            else:
+                self.sam_handler.object_id_to_group_id = old_mapping
         self.sam_handler.media_files = dict_representation["sam_handler_media_files"]
         self.sam_handler.curr_img_idx = dict_representation["sam_handler_curr_img_idx"]
         self.sam_handler.current_stage = dict_representation["sam_handler_current_stage"]
@@ -166,7 +193,7 @@ class Annotator:
             "extra_frame": self.extra_frame,
             "extra_frame_masks": self.extra_frame_masks,
             "sam_handler_labels": self.sam_handler.labels,
-            "sam_handler_object_id_to_label_name": self.sam_handler.object_id_to_label_name,
+            "sam_handler_object_id_to_group_id": self.sam_handler.object_id_to_group_id,
             "sam_handler_media_files": self.sam_handler.media_files,
             "sam_handler_curr_img_idx": self.sam_handler.curr_img_idx,
             "sam_handler_current_stage": self.sam_handler.current_stage,
@@ -263,6 +290,16 @@ class Annotator:
         if abs_idx in self.idx_to_path:
             return self.idx_to_path[abs_idx]
         return os.path.join(self.frames_dir, f"{abs_idx:06d}.jpg")
+    def _frame_has_prompts(self, local_frame_idx):
+        """Check if a specific frame has any prompts."""
+        for label in self.sam_handler.labels:
+            for pt in label.pts.get(self.current_block, []):
+                if pt.idx == local_frame_idx:
+                    return True
+            for box in label.boxes.get(self.current_block, []):
+                if box.idx == local_frame_idx:
+                    return True
+        return False
     def has_prompts(self, block_idx):
         for label in self.get_labels():
             if len(label.pts.get(block_idx, [])) > 0 or len(label.boxes.get(block_idx, [])):
@@ -273,6 +310,11 @@ class Annotator:
             if self.sam_handler.labels[idx].name == label_name:
                 return idx
         return -1
+    def get_label_idx_by_group_id(self, group_id):
+        for idx in range(len(self.sam_handler.labels)):
+            if self.sam_handler.labels[idx].group_id == group_id:
+                return idx
+        return -1
     def get_current_label(self):
         if self.curr_label_idx < 0:
             return None
@@ -280,11 +322,6 @@ class Annotator:
     def set_current_label(self,idx):
         self.curr_label_idx = idx
     def set_label_name(self, idx, name):
-        old_name = self.sam_handler.labels[idx].name
-        new_name = name
-        for masks in self.masks.values():
-            if old_name in masks:
-                masks[new_name] = masks.pop(old_name)
         self.sam_handler.labels[idx].name = name
     def get_labels(self):
         return self.sam_handler.labels
@@ -312,10 +349,10 @@ class Annotator:
         if idx < 0 or idx >= len(self.sam_handler.labels):
             return False
         removed = self.sam_handler.labels.pop(idx)
-        # also wipe any masks that referenced this label name
+        # also wipe any masks that referenced this label's group_id
         for path_masks in self.masks.values():
-            if removed.name in path_masks:
-                del path_masks[removed.name]
+            if removed.group_id in path_masks:
+                del path_masks[removed.group_id]
         # adjust current selection
         if len(self.sam_handler.labels) == 0:
             self.curr_label_idx = -1
@@ -372,10 +409,12 @@ class Annotator:
         if not self.tracking_results:
             return False, []
         for k, v in self.tracking_results.items():
-            for label, _ in v.items():
-                self.sam_handler.labels[self.get_label_idx(label)].prop_frames[self.current_block].add(k)
+            for group_id, _ in v.items():
+                li = self.get_label_idx_by_group_id(group_id)
+                if li >= 0:
+                    self.sam_handler.labels[li].prop_frames[self.current_block].add(k)
         return True, list(self.tracking_results.keys())
-    def apply_masks(self, update_progress_callback):
+    def apply_masks(self, update_progress_callback, is_single=False):
         total_steps = len(list(self.tracking_results.keys()))
         current_step = 0
         n_added = 0
@@ -385,18 +424,19 @@ class Annotator:
             if local_frame_idx >= len(self.media_files):
                 continue
             abs_idx = self._abs_idx(local_frame_idx)
-            # protect frames that already have JSON (e.g. from Single)
             existing_json = os.path.join(json_dir, f"{abs_idx:06d}.json")
-            if os.path.exists(existing_json):
-                n_skipped += 1
-                current_step += 1
-                continue
+            if os.path.exists(existing_json) and not is_single:
+                if self._frame_has_prompts(local_frame_idx):
+                    # propagation skips frames that have manual prompts
+                    n_skipped += 1
+                    current_step += 1
+                    continue
             frame_path = self.media_files[local_frame_idx]
             self.idx_to_path[abs_idx] = frame_path
             self.masks[abs_idx] = {}
             try:
-                for label_name, mask in frame_masks.items():
-                    self.masks[abs_idx][label_name] = PackedMasks(mask.squeeze().astype(bool))
+                for group_id, mask in frame_masks.items():
+                    self.masks[abs_idx][group_id] = PackedMasks(mask.squeeze().astype(bool))
                 n_added += len(self.masks[abs_idx])
                 progress_percent = (current_step / max(1, total_steps)) * 100
                 update_progress_callback(f"Applying masks: {current_step + 1}/{total_steps}", progress_percent)
@@ -445,8 +485,10 @@ class Annotator:
             self.mode = "prompts"
             return False, []
         for k, v in self.tracking_results.items():
-            for label,_ in v.items():
-                self.sam_handler.labels[self.get_label_idx(label)].prop_frames[self.current_block].add(k)
+            for group_id, _ in v.items():
+                li = self.get_label_idx_by_group_id(group_id)
+                if li >= 0:
+                    self.sam_handler.labels[li].prop_frames[self.current_block].add(k)
         return True, list(self.tracking_results.keys())
     def propagate(self,flag,update_progress_callback):
         if flag == 0:
@@ -473,18 +515,13 @@ class Annotator:
                 self.extra_frame[self.current_block] = self.tracking_results[self.block_size]
                 self.tracking_results.pop(self.block_size)
                 self.extra_frame_masks[self.current_block] = {}
-                for label_name, mask in self.extra_frame[self.current_block].items():
-                    label_color = None
-                    for label in self.sam_handler.labels:
-                        if label.name == label_name:
-                            label_color = self.hex_to_rgb(label.col)
-                            break
-                    if label_color is None:
-                        label_color = (255, 255, 255)
-                    self.extra_frame_masks[self.current_block][label_name]=PackedMasks(mask.squeeze().astype(bool))
+                for group_id, mask in self.extra_frame[self.current_block].items():
+                    self.extra_frame_masks[self.current_block][group_id] = PackedMasks(mask.squeeze().astype(bool))
             for k, v in self.tracking_results.items():
-                for label,_ in v.items():
-                    self.sam_handler.labels[self.get_label_idx(label)].prop_frames[self.current_block].add(k)
+                for group_id, _ in v.items():
+                    li = self.get_label_idx_by_group_id(group_id)
+                    if li >= 0:
+                        self.sam_handler.labels[li].prop_frames[self.current_block].add(k)
         return True, list(self.tracking_results.keys())
     
     # AUTO-PROMPTING ~ DONE
@@ -586,9 +623,9 @@ class Annotator:
         for step, abs_idx in enumerate(sorted_keys):
             shapes = []
             for label in self.sam_handler.labels:
-                if label.name not in self.masks[abs_idx]:
+                if label.group_id not in self.masks[abs_idx]:
                     continue
-                mask_bin = self.masks[abs_idx][label.name].astype(np.uint8) * 255
+                mask_bin = self.masks[abs_idx][label.group_id].astype(np.uint8) * 255
                 if img_h == 0:
                     img_h, img_w = mask_bin.shape[:2]
                 cnts, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -599,7 +636,7 @@ class Annotator:
                     shapes.append({
                         "label": label.name,
                         "points": points,
-                        "group_id": None,
+                        "group_id": label.group_id,
                         "shape_type": "polygon",
                         "flags": {}
                     })
@@ -644,23 +681,30 @@ class Annotator:
         if img is None:
             return None
         overlay = img.copy()
-        drawn_labels = set()
+        drawn_labels = {}  # {display_name: hex_col}
         for shape in frame_json.get("shapes", []):
             label_name = shape.get("label", "")
+            gid = shape.get("group_id", None)
             points = shape.get("points", [])
             if not points:
                 continue
             hex_col = "#ffffff"
-            for lbl in self.sam_handler.labels:
-                if lbl.name == label_name:
-                    hex_col = lbl.col
-                    break
+            if gid is not None:
+                for lbl in self.sam_handler.labels:
+                    if lbl.group_id == gid:
+                        hex_col = lbl.col
+                        break
+            else:
+                for lbl in self.sam_handler.labels:
+                    if lbl.name == label_name:
+                        hex_col = lbl.col
+                        break
             r, g, b = self.hex_to_rgb(hex_col)
             colour = (b, g, r)
             pts = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
             cv2.fillPoly(overlay, [pts], colour)
             cv2.polylines(overlay, [pts], isClosed=True, color=colour, thickness=2)
-            drawn_labels.add(label_name)
+            drawn_labels[label_name] = hex_col
         blended = cv2.addWeighted(img, 0.55, overlay, 0.45, 0)
         # frame number (large, bottom-left)
         cv2.putText(blended, f"Frame {abs_idx}", (10, blended.shape[0] - 15),
@@ -669,12 +713,7 @@ class Annotator:
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 1, cv2.LINE_AA)
         # legend
         legend_y = 22
-        for label_name in drawn_labels:
-            hex_col = "#ffffff"
-            for lbl in self.sam_handler.labels:
-                if lbl.name == label_name:
-                    hex_col = lbl.col
-                    break
+        for label_name, hex_col in drawn_labels.items():
             r, g, b = self.hex_to_rgb(hex_col)
             cv2.rectangle(blended, (8, legend_y - 14), (24, legend_y), (b, g, r), -1)
             cv2.putText(blended, label_name, (30, legend_y),
@@ -800,32 +839,34 @@ class Annotator:
                 with open(json_files[frame_idx], 'r', encoding='utf-8') as f:
                     frame_json = json.load(f)
                 overlay = frame.copy()
-                drawn_labels = set()
+                drawn_labels = {}  # {display_name: hex_col}
                 for shape in frame_json.get("shapes", []):
                     label_name = shape.get("label", "")
+                    gid = shape.get("group_id", None)
                     points = shape.get("points", [])
                     if not points:
                         continue
                     hex_col = "#ffffff"
-                    for lbl in self.sam_handler.labels:
-                        if lbl.name == label_name:
-                            hex_col = lbl.col
-                            break
+                    if gid is not None:
+                        for lbl in self.sam_handler.labels:
+                            if lbl.group_id == gid:
+                                hex_col = lbl.col
+                                break
+                    else:
+                        for lbl in self.sam_handler.labels:
+                            if lbl.name == label_name:
+                                hex_col = lbl.col
+                                break
                     r, g, b = self.hex_to_rgb(hex_col)
                     colour = (b, g, r)
                     pts = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
                     cv2.fillPoly(overlay, [pts], colour)
                     cv2.polylines(overlay, [pts], True, colour, 2)
-                    drawn_labels.add(label_name)
+                    drawn_labels[label_name] = hex_col
                 frame = cv2.addWeighted(frame, 0.35, overlay, 0.65, 0)
                 # legend
                 legend_y = 22
-                for label_name in drawn_labels:
-                    hex_col = "#ffffff"
-                    for lbl in self.sam_handler.labels:
-                        if lbl.name == label_name:
-                            hex_col = lbl.col
-                            break
+                for label_name, hex_col in drawn_labels.items():
                     r, g, b = self.hex_to_rgb(hex_col)
                     cv2.rectangle(frame, (8, legend_y - 14), (24, legend_y), (b, g, r), -1)
                     cv2.putText(frame, label_name, (30, legend_y),
@@ -878,7 +919,7 @@ class Annotator:
         self.mode = "prompts"
         self.view_mode = "prompts"
         self.tracking_results = {}
-        self.sam_handler.object_id_to_label_name = {}
+        self.sam_handler.object_id_to_group_id = {}
         self.sam_handler.object_ids = {}
         self.sam_handler.media_files = []
         self.curr_img_shape = (0,0,0)
@@ -1073,9 +1114,9 @@ class Annotator:
         # try memory first (during apply_masks, before export)
         if abs_idx in self.masks and self.masks[abs_idx]:
             mask_overlay = np.zeros(self.curr_img_shape, dtype=np.uint8)
-            for label_name, mask in self.masks[abs_idx].items():
+            for group_id, mask in self.masks[abs_idx].items():
                 label_color = self.hex_to_rgb(
-                    next((l.col for l in self.sam_handler.labels if l.name == label_name), "#ffffff"))
+                    next((l.col for l in self.sam_handler.labels if l.group_id == group_id), "#ffffff"))
                 mask_overlay[np.asarray(mask, dtype=bool)] = label_color
             return mask_overlay
 
@@ -1090,10 +1131,14 @@ class Annotator:
         mask_overlay = np.zeros((h, w, 3), dtype=np.uint8)
         for shape in shapes:
             label_name = shape.get("label", "")
+            gid = shape.get("group_id", None)
             points = shape.get("points", [])
             if not points:
                 continue
-            hex_col = next((l.col for l in self.sam_handler.labels if l.name == label_name), "#ffffff")
+            if gid is not None:
+                hex_col = next((l.col for l in self.sam_handler.labels if l.group_id == gid), "#ffffff")
+            else:
+                hex_col = next((l.col for l in self.sam_handler.labels if l.name == label_name), "#ffffff")
             color = self.hex_to_rgb(hex_col)
             pts = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
             cv2.fillPoly(mask_overlay, [pts], color)

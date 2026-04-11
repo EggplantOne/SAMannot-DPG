@@ -14,9 +14,10 @@ class PBox:
         self.pt_type = pt_type
         self.idx = idx
 class Label:
-    def __init__(self, name, col=None):
+    def __init__(self, name, col=None, group_id=0):
         self.name = name
         self.col = col
+        self.group_id = group_id
         self.pts = {}
         self.boxes = {}
         self.features = []
@@ -57,6 +58,7 @@ class Label_Handler:
     def __init__(self):
         self.colour_map = self.generate_color_map()
         self.current_label_idx = 0
+        self._next_group_id = 1
     def generate_color_map(self,N=256): # PASCAL VOC
         def bitget(byteval, idx):
             return ((byteval & (1 << idx)) != 0)
@@ -76,4 +78,6 @@ class Label_Handler:
     def create_new_label(self,name):
         label_colour = self.convert_to_hexadecimal(self.colour_map[self.current_label_idx%len(self.colour_map)])
         self.current_label_idx += 1
-        return Label(name,label_colour)
+        gid = self._next_group_id
+        self._next_group_id += 1
+        return Label(name, label_colour, group_id=gid)

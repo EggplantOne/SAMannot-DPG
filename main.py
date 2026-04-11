@@ -391,7 +391,7 @@ def cb_label_listbox(sender, app_data):
 
 def cb_add_label(sender, app_data):
     name = dpg.get_value("label_name_input").strip()
-    if not name or ann.check_label_existence(name):
+    if not name:
         return
     ann.add_label(name)
     presets = load_label_presets()
@@ -684,7 +684,7 @@ def cb_single(sender, app_data):
         success, prop_frames = ann.generate_mask()
         if success:
             _show_progress("Applying masks...", 50)
-            ann.apply_masks(_progress_callback)
+            ann.apply_masks(_progress_callback, is_single=True)
             ann.view_mode = "overlay"
             load_and_show_frame()
             _show_progress("Single done.", 100)
