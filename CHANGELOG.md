@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.1] - 2026-04-12
+### Fixed
+- 修复 Load Session 后 overlay 模式看不到 mask 的问题（清空旧机器的 idx_to_path 路径映射）
+- 修复 Load Session 后切 block 失效的问题（修正跨机器的 media_path 路径）
+
+### Changed
+- C 键改为清除当前帧**所有 label** 的标注（之前只清当前选中的 label），同时删除该帧的 JSON 文件
+
 ## [1.1.0] - 2026-04-11
 ### Added
 - 支持同一标签多实例标注（如两把抓钳可以用同名标签独立标注和传播）

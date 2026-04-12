@@ -1007,15 +1007,19 @@ def cb_next_frame():
 
 
 def cb_clear_prompts():
-    if ann.curr_label_idx < 0:
-        return
-    label = ann.sam_handler.labels[ann.curr_label_idx]
+    """Clear all labels' prompts on the current frame + delete JSON."""
     block = ann.current_block
     frame_idx = ann.curr_img_idx
-    if block in label.pts:
-        label.pts[block] = [p for p in label.pts[block] if p.idx != frame_idx]
-    if block in label.boxes:
-        label.boxes[block] = [b for b in label.boxes[block] if b.idx != frame_idx]
+    for label in ann.sam_handler.labels:
+        if block in label.pts:
+            label.pts[block] = [p for p in label.pts[block] if p.idx != frame_idx]
+        if block in label.boxes:
+            label.boxes[block] = [b for b in label.boxes[block] if b.idx != frame_idx]
+    # also delete the JSON for this frame
+    abs_idx = ann._abs_idx(frame_idx)
+    json_path = os.path.join(ann.project_dir, "jsons", f"{abs_idx:06d}.json")
+    if os.path.exists(json_path):
+        os.remove(json_path)
     draw_overlays()
     update_prompt_list()
 
@@ -1386,6 +1390,9 @@ def _on_session_selected(sender, app_data):
         ann.sam_handler.model_loaded = False
         ann.sam_handler.model_loading = False
         ann.sam_handler.current_stage = 0
+
+        # clear stale path mappings (pkl may contain paths from another machine)
+        ann.idx_to_path = {}
 
         # ensure a label is selected
         if ann.curr_label_idx < 0 and len(ann.sam_handler.labels) > 0:
