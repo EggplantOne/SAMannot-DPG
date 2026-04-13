@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.2.0] - 2026-04-13
+### Fixed
+- 修复前向传播时添加了传播范围外的 prompt 导致 mask 漂移的问题（如远处 checkpoint 的旧标注染色到其他物体）
+- 修复 Pre-extract 文件对话框在中文路径下显示空目录的问题（DPG 已知 bug，中文路径导致 C++ 层解析失败）
+- Pre-extract 回调增加 `file_path_name` fallback，防止手动输入路径时程序崩溃
+
+### Added
+- Pre-extract 旁新增路径输入框 + Go 按钮，可直接粘贴视频路径抽帧，绕过 DPG 文件对话框
+- Z 键撤回当前标签在当前帧的最后一个标注点
+
 ## [1.1.1] - 2026-04-12
 ### Fixed
 - 修复 Load Session 后 overlay 模式看不到 mask 的问题（清空旧机器的 idx_to_path 路径映射）

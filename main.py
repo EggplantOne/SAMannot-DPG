@@ -988,6 +988,8 @@ def cb_key_handler(sender, app_data):
         cb_jump_prev_prompt()
     elif key == dpg.mvKey_E:
         cb_jump_next_prompt()
+    elif key == dpg.mvKey_Z:
+        cb_undo_last_prompt()
     elif key == dpg.mvKey_Delete:
         cb_delete_selected_prompt()
     elif key == dpg.mvKey_F11:
@@ -1020,8 +1022,38 @@ def cb_clear_prompts():
     json_path = os.path.join(ann.project_dir, "jsons", f"{abs_idx:06d}.json")
     if os.path.exists(json_path):
         os.remove(json_path)
+    # also clear prop_frames for this frame
+    for label in ann.sam_handler.labels:
+        pf = label.prop_frames.get(block, set())
+        pf.discard(frame_idx)
     draw_overlays()
     update_prompt_list()
+    _draw_timeline()
+
+
+def cb_undo_last_prompt():
+    """Undo the last added point or box for the current label on the current frame."""
+    if ann.curr_label_idx < 0 or ann.curr_img_idx < 0:
+        return
+    label = ann.sam_handler.labels[ann.curr_label_idx]
+    block = ann.current_block
+    frame = ann.curr_img_idx
+    # find the last point on this frame
+    pts = label.pts.get(block, [])
+    for i in range(len(pts) - 1, -1, -1):
+        if pts[i].idx == frame:
+            pts.pop(i)
+            draw_overlays()
+            update_prompt_list()
+            return
+    # if no point found, try last box on this frame
+    boxes = label.boxes.get(block, [])
+    for i in range(len(boxes) - 1, -1, -1):
+        if boxes[i].idx == frame:
+            boxes.pop(i)
+            draw_overlays()
+            update_prompt_list()
+            return
 
 
 def cb_delete_selected_prompt():
@@ -1219,7 +1251,7 @@ def cb_load_media(sender, app_data):
     with dpg.file_dialog(label="Select video or image file",
                          callback=_on_file_selected,
                          width=800, height=500, tag=tag,
-                         default_path=os.getcwd()):
+                         default_path=os.getcwd() if os.getcwd().isascii() else os.path.expanduser("~")):
         dpg.add_file_extension(".mp4", color=(0, 255, 0))
         dpg.add_file_extension(".avi", color=(0, 255, 0))
         dpg.add_file_extension(".mov", color=(0, 255, 0))
@@ -1238,7 +1270,7 @@ def cb_load_folder(sender, app_data):
                          callback=_on_folder_selected,
                          directory_selector=True,
                          width=800, height=500, tag=tag,
-                         default_path=os.getcwd()):
+                         default_path=os.getcwd() if os.getcwd().isascii() else os.path.expanduser("~")):
         pass
 
 
@@ -1501,7 +1533,7 @@ def cb_export_verify_video(sender, app_data):
         with dpg.file_dialog(label="Select source video for verify video",
                              callback=_on_verify_video_selected,
                              width=800, height=500, tag=tag,
-                             default_path=os.getcwd()):
+                             default_path=os.getcwd() if os.getcwd().isascii() else os.path.expanduser("~")):
             dpg.add_file_extension(".mp4", color=(0, 255, 0))
             dpg.add_file_extension(".avi", color=(0, 255, 0))
             dpg.add_file_extension(".mov", color=(0, 255, 0))
@@ -1513,10 +1545,19 @@ def cb_export_verify_video(sender, app_data):
 
 def _on_preextract_video_selected(sender, app_data):
     """DPG callback: user picked a video for pre-extraction."""
-    selections = app_data.get("selections", {})
-    if not selections:
+    try:
+        selections = app_data.get("selections", {})
+        if selections:
+            video_path = list(selections.values())[0]
+        else:
+            # fallback: user typed path directly in the dialog bar
+            video_path = app_data.get("file_path_name", "")
+        if not video_path:
+            return
+    except Exception as e:
+        print(f"Error parsing file dialog result: {e}")
+        _show_progress(f"Error: cannot parse selected path.", 0)
         return
-    video_path = list(selections.values())[0]
 
     def task():
         # validate
@@ -1615,11 +1656,21 @@ def cb_pre_extract(sender, app_data):
     with dpg.file_dialog(label="Select video to pre-extract",
                          callback=_on_preextract_video_selected,
                          width=800, height=500, tag=tag,
-                         default_path=os.getcwd()):
+                         default_path=os.getcwd() if os.getcwd().isascii() else os.path.expanduser("~")):
         dpg.add_file_extension(".mp4", color=(0, 255, 0))
         dpg.add_file_extension(".avi", color=(0, 255, 0))
         dpg.add_file_extension(".mov", color=(0, 255, 0))
         dpg.add_file_extension(".mkv", color=(0, 255, 0))
+        dpg.add_file_extension(".*")
+
+
+def cb_pre_extract_path(sender, app_data):
+    """Pre-extract from a manually typed video path (bypasses file dialog)."""
+    video_path = dpg.get_value("preextract_path_input").strip().strip('"').strip("'")
+    if not video_path:
+        _show_progress("Please paste a video path first.", 0)
+        return
+    _on_preextract_video_selected(None, {"file_path_name": video_path, "selections": {}})
 
 
 # ── fullscreen toggle (Step 9) ───────────────────────────────────────────────
@@ -1687,6 +1738,10 @@ def build_ui():
         # ── toolbar ──
         with dpg.group(horizontal=True):
             dpg.add_button(label="Pre-extract", callback=cb_pre_extract)
+            dpg.add_input_text(tag="preextract_path_input", hint="Or paste video path here",
+                               width=250, on_enter=True, callback=cb_pre_extract_path)
+            dpg.add_button(label="Go", callback=cb_pre_extract_path, width=30)
+            dpg.add_spacer(width=5)
             dpg.add_button(label="Load Folder", callback=cb_load_folder)
             dpg.add_spacer(width=10)
             dpg.add_text("Block Size:")

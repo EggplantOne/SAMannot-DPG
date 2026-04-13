@@ -222,14 +222,25 @@ class SAM_Annotator:
                                 )
                                 break
                 else:
-                    # forward: add ALL prompts from all frames in the current block
+                    # forward: compute propagation range first, then only add prompts within range
+                    prop_end = len(self.media_files) if end_frame_idx is None else end_frame_idx
+                    max_efi = 1000000
+                    prop_extra_frame = True
+                    for k,v in self.propagation_blocks[self.current_block].items():
+                        if k > start_frame_idx and k < max_efi:
+                            max_efi = k
+                            prop_extra_frame = False
+                    prop_end = int(np.amin([prop_end, max_efi]))
+
                     for label in self.labels:
                         obj_id = self._get_object_id(label.group_id)
                         prompt_frames = set()
                         for pt in label.pts.get(self.current_block, []):
-                            prompt_frames.add(pt.idx)
+                            if start_frame_idx <= pt.idx <= prop_end:
+                                prompt_frames.add(pt.idx)
                         for box in label.boxes.get(self.current_block, []):
-                            prompt_frames.add(box.idx)
+                            if start_frame_idx <= box.idx <= prop_end:
+                                prompt_frames.add(box.idx)
                         for f_idx in sorted(prompt_frames):
                             pts = []
                             lbls = []
@@ -255,16 +266,14 @@ class SAM_Annotator:
                                     )
                                     break
             results = {}
-            prop_extra_frame = True
             if direction == 1:
                 if end_frame_idx is None:
                     end_frame_idx = len(self.media_files)
-                max_efi = 1000000
-                for k,v in self.propagation_blocks[self.current_block].items():
-                    if k > start_frame_idx and k < max_efi:
-                        max_efi = k
-                        prop_extra_frame = False
-                end_frame_idx = np.amin([end_frame_idx,max_efi])
+                if not prop_extra_frame:
+                    max_efi_adj = max_efi
+                else:
+                    max_efi_adj = 1000000
+                end_frame_idx = int(np.amin([end_frame_idx, max_efi_adj]))
                 if not prop_extra_frame:
                     end_frame_idx += 1  # include the checkpoint frame itself
                 else:
