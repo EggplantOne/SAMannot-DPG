@@ -518,9 +518,19 @@ def _get_local_mouse_in_drawlist():
         return -1, -1
 
 
+def _is_mouse_over_canvas():
+    """Check if the mouse is hovering over the canvas drawlist, not over UI panels."""
+    try:
+        return dpg.is_item_hovered(DRAW_TAG)
+    except Exception:
+        return False
+
+
 def cb_mouse_click(sender, app_data):
     """Left click = foreground point (pt_type=1)."""
     if ann.curr_img_idx < 0:
+        return
+    if not _is_mouse_over_canvas():
         return
     if ann.curr_label_idx < 0:
         _show_progress("Select a label first.", 0)
@@ -582,6 +592,8 @@ def cb_mouse_down_right(sender, app_data):
     """Right mouse button pressed — record start position for drag or bg point."""
     global dragging, drag_start, _right_click_start
     if ann.curr_img_idx < 0 or ann.curr_label_idx < 0:
+        return
+    if not _is_mouse_over_canvas():
         return
     lx, ly = _get_local_mouse_in_drawlist()
     if is_in_image(lx, ly):
