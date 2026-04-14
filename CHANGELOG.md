@@ -1,12 +1,19 @@
 # Changelog
 
+## [1.3.0] - 2026-04-14
+### Added
+- UI 重构：顶部 toolbar 改为菜单栏（File / Edit / Settings），界面更简洁
+- 新增 Reassign Label 功能（Edit 菜单），可在指定帧范围内将标注从一个标签批量转移到另一个标签
+- Load Model 改为子菜单，直接选择模型大小即加载，无需先选再点
+- Pre-extract 抽帧前新增质量选择弹窗（Standard / High Quality），显示预估磁盘占用
+
 ## [1.2.0] - 2026-04-13
 ### Fixed
 - 修复前向传播时添加了传播范围外的 prompt 导致 mask 漂移的问题（如远处 checkpoint 的旧标注染色到其他物体）
 - 修复 Intel XPU 上推理精度严重下降的问题（autocast 从 float16 改为 bfloat16，Intel 核显对 FP16 硬件支持差）
 - 修复点击 UI 控件（模型选择、标签库等）时误触画布添加标注点的问题
 - 修复 Pre-extract 文件对话框在中文路径下显示空目录的问题（DPG 已知 bug，中文路径导致 C++ 层解析失败）
-- Pre-extract 回调增加 `file_path_name` fallback，防止手动输入路径时程序崩溃
+- 修复 Pre-extract 手动输入路径时程序崩溃的问题
 
 ### Added
 - Pre-extract 旁新增路径输入框 + Go 按钮，可直接粘贴视频路径抽帧，绕过 DPG 文件对话框

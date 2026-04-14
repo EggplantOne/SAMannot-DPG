@@ -4,6 +4,13 @@
 
 你可以用这个工具在视频中标注物体，SAM2 会自动把标注传播到其他帧，最终导出 LabelMe 格式的 JSON 分割结果。
 
+### v1.3.0 更新 (2026-04-14)
+
+- **UI 重构**：顶部改为菜单栏（File / Edit / Settings），界面更简洁
+- **批量重分配标签**：Edit → Reassign Label，可在指定帧范围内将标注从一个标签转移到另一个标签
+- **抽帧质量选择**：Pre-extract 时可选 Standard 或 High Quality，显示预估磁盘占用
+- **Intel XPU 精度修复**：修复 Intel 核显上推理结果不准的问题
+
 ---
 
 ## 你需要准备什么
@@ -232,22 +239,22 @@ python main.py
 
 ### 1. 抽帧
 
-- 点击工具栏的 **Pre-extract** 按钮，选择视频文件（.mp4 等）
+- 点击菜单栏 **File → Pre-extract (browse)** 选择视频文件，或 **File → Pre-extract (paste path)** 直接粘贴视频路径
+- 弹出质量选择窗口，显示帧数和预估磁盘占用：**Standard**（约 200KB/帧）或 **High Quality**（约 300KB/帧，接近无损）
+  - 例：1080p 视频 15000 帧，Standard 约 3GB，High Quality 约 4.5GB
 - 等待抽帧完成（进度条会显示进度）
 - 抽好的帧保存在 `projects/{视频名}/frames/` 目录下
 - 如果之前已经抽过，会自动跳过
 
-> 全量抽帧一个 1080p、15000 帧的视频大约需要 4GB 磁盘空间。
-
 ### 2. 加载帧
 
-- 点击 **Load Folder** 选择刚才抽好的帧目录（`projects/{视频名}/frames/`）
-- **Block Size** 设置每次处理的帧数，默认 200，显存小可以调到 50~100
-- 用 **<<** / **>>** 按钮切换 Block
+- 点击菜单栏 **File → Load Folder** 选择刚才抽好的帧目录（`projects/{视频名}/frames/`）
+- **Block Size** 在菜单栏 **Settings** 中设置，默认 200，显存小可以调到 50~100
+- 用菜单栏的 **<<** / **>>** 按钮切换 Block
 
 ### 3. 加载模型
 
-- 点击工具栏的 **Load Model** 按钮
+- 点击菜单栏 **Load Model**，选择模型大小（Large/Base+/Small/Tiny）即开始加载
 - 等待左侧进度条显示加载完成（通常 5~15 秒）
 - 模型只需加载一次，切 Block 不需要重新加载
 
@@ -292,9 +299,10 @@ python main.py
 
 ### 8. 保存 & 加载
 
-- **Save**：保存当前标注状态到 `projects/{视频名}/{视频名}.pkl`
-- **Load Session**：加载之前保存的 `.pkl` 文件，继续标注（加载后需要重新点 Load Model）
-- **Reset**：清空所有标注，重新开始
+- **File → Save**：保存当前标注状态到 `projects/{视频名}/{视频名}.pkl`
+- **File → Load Session**：加载之前保存的 `.pkl` 文件，继续标注（加载后需要重新点 Load Model）
+- **File → Reset**：清空内存中的标注状态（不删除已导出的 JSON 文件）
+- **Edit → Reassign Label**：在指定帧范围内将标注从一个标签批量转移到另一个标签
 
 ### 9. 导出
 

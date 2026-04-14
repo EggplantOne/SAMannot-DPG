@@ -356,6 +356,7 @@ def refresh_label_listbox():
     dpg.configure_item("label_listbox", items=items)
     if 0 <= ann.curr_label_idx < len(items):
         dpg.set_value("label_listbox", items[ann.curr_label_idx])
+    _refresh_reassign_combos()
 
 
 def update_prompt_list():
@@ -850,6 +851,15 @@ MODEL_OPTIONS = {
 }
 
 
+_selected_model_name = "Large"
+
+def _load_model_by_name(name):
+    """Set model name and trigger load."""
+    global _selected_model_name
+    _selected_model_name = name
+    cb_load_model(None, None)
+
+
 def cb_load_model(sender, app_data):
     """Load SAM2 model in background thread."""
     if inference_busy:
@@ -857,9 +867,7 @@ def cb_load_model(sender, app_data):
         return
 
     # get selected model size
-    model_name = "Large"
-    if _dpg_ready and dpg.does_item_exist("model_combo"):
-        model_name = dpg.get_value("model_combo")
+    model_name = _selected_model_name
     cfg, ckpt = MODEL_OPTIONS.get(model_name, MODEL_OPTIONS["Large"])
 
     base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
@@ -954,7 +962,8 @@ def cb_jump_next_prompt():
 # ── keyboard ─────────────────────────────────────────────────────────────────
 
 def _is_input_focused():
-    for tag in ("label_name_input", "block_size_input", "session_name_input"):
+    for tag in ("label_name_input", "block_size_input", "session_name_input",
+                 "preextract_path_input", "reassign_start", "reassign_end"):
         if dpg.does_item_exist(tag) and dpg.is_item_focused(tag):
             return True
     return False
@@ -1571,31 +1580,63 @@ def _on_preextract_video_selected(sender, app_data):
         _show_progress(f"Error: cannot parse selected path.", 0)
         return
 
+    # validate video first
+    if not os.path.exists(video_path):
+        _show_progress("Video not found.", 0)
+        return
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        _show_progress("Cannot open video.", 0)
+        return
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    if total_frames <= 0:
+        _show_progress("Video has 0 frames.", 0)
+        return
+
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    out_dir = os.path.join("projects", video_name, "frames")
+
+    if os.path.exists(out_dir):
+        existing = [f for f in os.listdir(out_dir) if f.endswith(".jpg")]
+        if len(existing) > 0:
+            _show_progress(f"Frames already exist ({len(existing)} files). Use Load Folder to open.", 100)
+            return
+
+    # show quality selection dialog
+    _show_extract_quality_dialog(video_path, total_frames, out_dir)
+
+
+def _show_extract_quality_dialog(video_path, total_frames, out_dir):
+    """Show a dialog for the user to choose extraction quality before extracting."""
+    tag = "extract_quality_modal"
+    if dpg.does_item_exist(tag):
+        dpg.delete_item(tag)
+
+    est_standard_gb = total_frames * 200 / 1024 / 1024  # ~200KB per frame at qscale=2
+    est_high_gb = total_frames * 300 / 1024 / 1024       # ~300KB per frame at qscale=1
+
+    def on_quality_selected(quality):
+        _hide_modal(tag)
+        _do_pre_extract(video_path, total_frames, out_dir, quality == "high")
+
+    with dpg.window(label="Pre-extract Quality", tag=tag,
+                    modal=True, show=True, width=350, height=160, no_resize=True):
+        dpg.add_text(f"{total_frames} frames to extract")
+        dpg.add_spacer(height=5)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label=f"Standard (~{est_standard_gb:.1f} GB)",
+                           callback=lambda: on_quality_selected("standard"), width=-1)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label=f"High Quality (~{est_high_gb:.1f} GB)",
+                           callback=lambda: on_quality_selected("high"), width=-1)
+        dpg.add_button(label="Cancel", callback=lambda: _hide_modal(tag), width=-1)
+
+
+def _do_pre_extract(video_path, total_frames, out_dir, high_quality):
+    """Actually run the pre-extraction after quality is chosen."""
+
     def task():
-        # validate
-        if not os.path.exists(video_path):
-            _show_progress("Video not found.", 0)
-            return
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            _show_progress("Cannot open video.", 0)
-            return
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        cap.release()
-        if total_frames <= 0:
-            _show_progress("Video has 0 frames.", 0)
-            return
-
-        # output dir: projects/{video_name}/frames/
-        video_name = os.path.splitext(os.path.basename(video_path))[0]
-        out_dir = os.path.join("projects", video_name, "frames")
-
-        # check if already extracted
-        if os.path.exists(out_dir):
-            existing = [f for f in os.listdir(out_dir) if f.endswith(".jpg")]
-            if len(existing) > 0:
-                _show_progress(f"Frames already exist ({len(existing)} files). Use Load Folder to open.", 100)
-                return
 
         os.makedirs(out_dir, exist_ok=True)
 
@@ -1609,15 +1650,18 @@ def _on_preextract_video_selected(sender, app_data):
         except Exception:
             pass
 
+        qscale = "1" if high_quality else "2"
+
         ffmpeg = ann._get_ffmpeg_exe()
         if ffmpeg:
-            _show_progress(f"Pre-extracting {total_frames} frames (ffmpeg)...", 0)
+            mode_str = "high quality" if high_quality else "standard"
+            _show_progress(f"Pre-extracting {total_frames} frames ({mode_str}, ffmpeg)...", 0)
             cmd = [
                 ffmpeg, "-y",
                 "-i", video_path,
                 "-vsync", "0",
                 "-frames:v", str(total_frames),
-                "-qscale:v", "2",
+                "-qscale:v", qscale,
                 "-start_number", "0",
                 os.path.join(out_dir, "%06d.jpg"),
             ]
@@ -1626,13 +1670,11 @@ def _on_preextract_video_selected(sender, app_data):
             n_done = 0
             while proc.poll() is None:
                 time.sleep(0.3)
-                # count extracted frames incrementally
                 while n_done < total_frames and os.path.exists(
                         os.path.join(out_dir, f"{n_done:06d}.jpg")):
                     n_done += 1
                 pct = min(99, (n_done / total_frames) * 100)
                 _show_progress(f"Extracting: {n_done}/{total_frames} ({pct:.0f}%)", pct)
-            # final count
             while n_done < total_frames and os.path.exists(
                     os.path.join(out_dir, f"{n_done:06d}.jpg")):
                 n_done += 1
@@ -1643,11 +1685,12 @@ def _on_preextract_video_selected(sender, app_data):
         else:
             _show_progress(f"Pre-extracting {total_frames} frames (cv2)...", 0)
             cap = cv2.VideoCapture(video_path)
+            jpg_quality = [cv2.IMWRITE_JPEG_QUALITY, 100 if high_quality else 95]
             for i in range(total_frames):
                 ret, frame = cap.read()
                 if not ret:
                     break
-                cv2.imwrite(os.path.join(out_dir, f"{i:06d}.jpg"), frame)
+                cv2.imwrite(os.path.join(out_dir, f"{i:06d}.jpg"), frame, jpg_quality)
                 if i % 50 == 0:
                     _show_progress(f"Extracting: {i}/{total_frames}",
                                    (i / total_frames) * 100)
@@ -1676,13 +1719,119 @@ def cb_pre_extract(sender, app_data):
         dpg.add_file_extension(".*")
 
 
-def cb_pre_extract_path(sender, app_data):
-    """Pre-extract from a manually typed video path (bypasses file dialog)."""
+
+
+# ── reassign label ───────────────────────────────────────────────────────────
+
+def cb_reassign_label(sender, app_data):
+    """Reassign masks/prompts from one label to another within a frame range."""
+    if not ann.sam_handler.labels or len(ann.sam_handler.labels) < 2:
+        _show_progress("Need at least 2 labels to reassign.", 0)
+        return
+    src_name = dpg.get_value("reassign_src")
+    dst_name = dpg.get_value("reassign_dst")
+    if not src_name or not dst_name or src_name == dst_name:
+        _show_progress("Source and target must be different labels.", 0)
+        return
+    start_abs = dpg.get_value("reassign_start")
+    end_abs = dpg.get_value("reassign_end")
+    if start_abs > end_abs:
+        _show_progress("Start frame must be <= end frame.", 0)
+        return
+    # find group_ids from display names like "0: 抓钳"
+    src_idx = int(src_name.split(":")[0])
+    dst_idx = int(dst_name.split(":")[0])
+    src_gid = ann.sam_handler.labels[src_idx].group_id
+    dst_gid = ann.sam_handler.labels[dst_idx].group_id
+
+    n = ann.reassign_label_in_range(src_gid, dst_gid, start_abs, end_abs)
+    _show_progress(f"Reassigned {n} frames: {ann.sam_handler.labels[src_idx].name} -> {ann.sam_handler.labels[dst_idx].name} [{start_abs}-{end_abs}]", 100)
+    load_and_show_frame()
+    _draw_timeline()
+
+
+def _refresh_reassign_combos():
+    """Update the reassign source/target combo boxes with current labels."""
+    if not dpg.does_item_exist("reassign_src"):
+        return
+    items = [f"{i}: {l.name}" for i, l in enumerate(ann.sam_handler.labels)]
+    dpg.configure_item("reassign_src", items=items)
+    dpg.configure_item("reassign_dst", items=items)
+
+
+# ── modal dialogs ────────────────────────────────────────────────────────────
+
+def _show_modal(tag):
+    """Show a modal dialog window."""
+    if dpg.does_item_exist(tag):
+        _refresh_reassign_combos()
+        dpg.configure_item(tag, show=True)
+
+
+def _hide_modal(tag):
+    """Hide a modal dialog window."""
+    if dpg.does_item_exist(tag):
+        dpg.configure_item(tag, show=False)
+
+
+def _cb_preextract_path_apply(sender, app_data):
+    """Apply pre-extract from pasted path in modal."""
     video_path = dpg.get_value("preextract_path_input").strip().strip('"').strip("'")
+    _hide_modal("preextract_modal")
     if not video_path:
         _show_progress("Please paste a video path first.", 0)
         return
     _on_preextract_video_selected(None, {"file_path_name": video_path, "selections": {}})
+
+
+def _cb_reassign_apply(sender, app_data):
+    """Apply reassign from modal."""
+    cb_reassign_label(sender, app_data)
+    _hide_modal("reassign_modal")
+
+
+def _build_modal_dialogs():
+    """Create modal dialog windows (hidden by default)."""
+    # Pre-extract path dialog
+    with dpg.window(label="Pre-extract from path", tag="preextract_modal",
+                    modal=True, show=False, width=500, height=100, no_resize=True):
+        dpg.add_input_text(tag="preextract_path_input", hint="Paste video path here",
+                           width=-1, on_enter=True, callback=_cb_preextract_path_apply)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="OK", callback=_cb_preextract_path_apply, width=100)
+            dpg.add_button(label="Cancel", callback=lambda: _hide_modal("preextract_modal"), width=100)
+
+    # Reassign label dialog
+    with dpg.window(label="Reassign Label", tag="reassign_modal",
+                    modal=True, show=False, width=350, height=200, no_resize=True):
+        dpg.add_text("Source label:")
+        dpg.add_combo(tag="reassign_src", items=[], width=-1)
+        dpg.add_text("Target label:")
+        dpg.add_combo(tag="reassign_dst", items=[], width=-1)
+        with dpg.group(horizontal=True):
+            dpg.add_text("Frames:")
+            dpg.add_input_int(tag="reassign_start", default_value=0, width=100,
+                              min_value=0, min_clamped=True)
+            dpg.add_text("-")
+            dpg.add_input_int(tag="reassign_end", default_value=0, width=100,
+                              min_value=0, min_clamped=True)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Apply", callback=_cb_reassign_apply, width=100)
+            dpg.add_button(label="Cancel", callback=lambda: _hide_modal("reassign_modal"), width=100)
+
+    # Settings dialog
+    with dpg.window(label="Settings", tag="settings_modal",
+                    modal=True, show=False, width=300, height=180, no_resize=True):
+        dpg.add_text("Session Name:")
+        dpg.add_input_text(tag="session_name_input", default_value="Session",
+                           width=-1, callback=cb_session_name)
+        dpg.add_spacer(height=5)
+        dpg.add_text("Block Size:")
+        dpg.add_input_int(tag="block_size_input", default_value=200, width=-1,
+                          min_value=10, max_value=10000, min_clamped=True,
+                          max_clamped=True)
+        dpg.add_spacer(height=5)
+        dpg.add_button(label="Close", callback=lambda: _hide_modal("settings_modal"), width=-1)
 
 
 # ── fullscreen toggle (Step 9) ───────────────────────────────────────────────
@@ -1747,36 +1896,28 @@ def build_ui():
         dpg.add_mouse_click_handler(button=dpg.mvMouseButton_Right, callback=cb_mouse_down_right)
 
     with dpg.window(tag="primary_window"):
-        # ── toolbar ──
-        with dpg.group(horizontal=True):
-            dpg.add_button(label="Pre-extract", callback=cb_pre_extract)
-            dpg.add_input_text(tag="preextract_path_input", hint="Or paste video path here",
-                               width=250, on_enter=True, callback=cb_pre_extract_path)
-            dpg.add_button(label="Go", callback=cb_pre_extract_path, width=30)
-            dpg.add_spacer(width=5)
-            dpg.add_button(label="Load Folder", callback=cb_load_folder)
-            dpg.add_spacer(width=10)
-            dpg.add_text("Block Size:")
-            dpg.add_input_int(tag="block_size_input", default_value=200, width=80,
-                              min_value=10, max_value=10000, min_clamped=True,
-                              max_clamped=True)
-            dpg.add_spacer(width=10)
-            dpg.add_button(label="<<", callback=cb_block_prev)
-            dpg.add_button(label=">>", callback=cb_block_next)
-            dpg.add_spacer(width=20)
-            dpg.add_combo(items=list(MODEL_OPTIONS.keys()),
-                          default_value="Large", tag="model_combo", width=80)
-            dpg.add_button(label="Load Model", callback=cb_load_model)
-        # ── toolbar row 2: session + info ──
-        with dpg.group(horizontal=True):
-            dpg.add_text("Session:")
-            dpg.add_input_text(tag="session_name_input", default_value="Session",
-                               width=120, callback=cb_session_name)
-            dpg.add_button(label="Save", callback=cb_save_session)
-            dpg.add_button(label="Load Session", callback=cb_load_session)
-            dpg.add_button(label="Reset", callback=cb_reset_session)
-            dpg.add_spacer(width=20)
+        # ── menu bar ──
+        with dpg.menu_bar():
+            with dpg.menu(label="File"):
+                dpg.add_menu_item(label="Pre-extract (browse)", callback=cb_pre_extract)
+                dpg.add_menu_item(label="Pre-extract (paste path)", callback=lambda: _show_modal("preextract_modal"))
+                dpg.add_menu_item(label="Load Folder", callback=cb_load_folder)
+                dpg.add_separator()
+                dpg.add_menu_item(label="Save", callback=cb_save_session)
+                dpg.add_menu_item(label="Load Session", callback=cb_load_session)
+                dpg.add_separator()
+                dpg.add_menu_item(label="Reset", callback=cb_reset_session)
+            with dpg.menu(label="Edit"):
+                dpg.add_menu_item(label="Reassign Label", callback=lambda: _show_modal("reassign_modal"))
+            dpg.add_menu_item(label="Settings", callback=lambda: _show_modal("settings_modal"))
+            dpg.add_menu_item(label="<<", callback=cb_block_prev)
+            dpg.add_menu_item(label=">>", callback=cb_block_next)
+            with dpg.menu(label="Load Model"):
+                for name in MODEL_OPTIONS.keys():
+                    dpg.add_menu_item(label=name, callback=lambda s, a, n=name: _load_model_by_name(n))
             dpg.add_text("  No media loaded", tag="info_text", color=(200, 220, 255))
+
+        _build_modal_dialogs()
 
         # ── main area ──
         with dpg.group(horizontal=True):

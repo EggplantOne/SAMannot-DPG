@@ -359,6 +359,87 @@ class Annotator:
         else:
             self.curr_label_idx = min(self.curr_label_idx, len(self.sam_handler.labels) - 1)
         return True
+    def reassign_label_in_range(self, src_group_id, dst_group_id, start_abs, end_abs):
+        """Move masks and prompts from src label to dst label within [start_abs, end_abs]."""
+        src_label = dst_label = None
+        for label in self.sam_handler.labels:
+            if label.group_id == src_group_id:
+                src_label = label
+            if label.group_id == dst_group_id:
+                dst_label = label
+        if not src_label or not dst_label:
+            return 0
+
+        dst_name = dst_label.name
+        n_modified = 0
+
+        # 1. Update JSON files
+        json_dir = os.path.join(self.project_dir, "jsons")
+        if os.path.isdir(json_dir):
+            for abs_idx in range(start_abs, end_abs + 1):
+                json_path = os.path.join(json_dir, f"{abs_idx:06d}.json")
+                if not os.path.exists(json_path):
+                    continue
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                changed = False
+                for shape in data.get("shapes", []):
+                    if shape.get("group_id") == src_group_id:
+                        shape["group_id"] = dst_group_id
+                        shape["label"] = dst_name
+                        changed = True
+                if changed:
+                    with open(json_path, 'w', encoding='utf-8') as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    n_modified += 1
+
+        # 2. Move prompts (pts and boxes) between labels
+        for block_idx in range(self.num_blocks):
+            block_start = block_idx * self.block_size
+            block_end = block_start + self.block_size - 1
+            if block_end < start_abs or block_start > end_abs:
+                continue
+            local_start = max(0, start_abs - block_start)
+            local_end = min(self.block_size - 1, end_abs - block_start)
+
+            # move pts
+            to_move = []
+            remaining = []
+            for pt in src_label.pts.get(block_idx, []):
+                if local_start <= pt.idx <= local_end:
+                    to_move.append(pt)
+                else:
+                    remaining.append(pt)
+            if to_move:
+                src_label.pts[block_idx] = remaining
+                if block_idx not in dst_label.pts:
+                    dst_label.pts[block_idx] = []
+                dst_label.pts[block_idx].extend(to_move)
+
+            # move boxes
+            to_move_b = []
+            remaining_b = []
+            for box in src_label.boxes.get(block_idx, []):
+                if local_start <= box.idx <= local_end:
+                    to_move_b.append(box)
+                else:
+                    remaining_b.append(box)
+            if to_move_b:
+                src_label.boxes[block_idx] = remaining_b
+                if block_idx not in dst_label.boxes:
+                    dst_label.boxes[block_idx] = []
+                dst_label.boxes[block_idx].extend(to_move_b)
+
+            # move prop_frames
+            src_pf = src_label.prop_frames.get(block_idx, set())
+            dst_pf = dst_label.prop_frames.get(block_idx, set())
+            frames_to_move = {f for f in src_pf if local_start <= f <= local_end}
+            if frames_to_move:
+                src_label.prop_frames[block_idx] = src_pf - frames_to_move
+                dst_label.prop_frames[block_idx] = dst_pf | frames_to_move
+
+        return n_modified
+
     def add_feature_to_current_label(self,feature_name):
         current_label = self.sam_handler.labels[self.curr_label_idx]
         current_label.features.append([(feature_name, self.curr_img_idx + self.current_block * self.block_size)])
