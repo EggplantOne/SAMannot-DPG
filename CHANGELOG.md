@@ -1,5 +1,15 @@
 # Changelog
 
+## [1.4.0] - 2026-04-15
+### Added
+- 新增 **Single Label Mode** 开关（SAM2 Inference 区域的复选框）
+  - 开启后，Forward / Backward / All 只传播当前选中的 label，推理结果合并写入已有 JSON，不影响其他 label 的标注
+  - 适用于"先标注器械 A 再追加器械 B"的增量标注场景，无需重跑所有 label
+- **Ctrl+S** 快捷键一键保存 session
+
+### Fixed
+- 修复 Single Label Mode 下传播不受 Checkpoint 限制的问题（现在与正常模式一致，前向停在下一个 checkpoint，反向停在上一个）
+
 ## [1.3.0] - 2026-04-14
 ### Added
 - UI 重构：顶部 toolbar 改为菜单栏（File / Edit / Settings），界面更简洁

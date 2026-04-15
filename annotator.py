@@ -495,16 +495,32 @@ class Annotator:
                 if li >= 0:
                     self.sam_handler.labels[li].prop_frames[self.current_block].add(k)
         return True, list(self.tracking_results.keys())
-    def apply_masks(self, update_progress_callback, is_single=False):
+    def apply_masks(self, update_progress_callback, is_single=False, merge=False):
         total_steps = len(list(self.tracking_results.keys()))
         current_step = 0
         n_added = 0
         n_skipped = 0
         json_dir = os.path.join(self.project_dir, "jsons")
+        merged_idxs = set()
         for local_frame_idx, frame_masks in self.tracking_results.items():
             if local_frame_idx >= len(self.media_files):
                 continue
             abs_idx = self._abs_idx(local_frame_idx)
+            frame_path = self.media_files[local_frame_idx]
+            if merge:
+                # Merge mode: write each label's mask into existing JSON
+                try:
+                    for group_id, mask in frame_masks.items():
+                        mask_bool = mask.squeeze().astype(bool)
+                        self._merge_mask_to_json(abs_idx, group_id, mask_bool, frame_path)
+                    n_added += len(frame_masks)
+                    merged_idxs.add(abs_idx)
+                except Exception as e:
+                    print(f"Error merging mask for frame {local_frame_idx}: {e}")
+                current_step += 1
+                if current_step % 10 == 0 or current_step == total_steps:
+                    update_progress_callback(f"Merging masks: {current_step}/{total_steps}", (current_step / max(1, total_steps)) * 100)
+                continue
             existing_json = os.path.join(json_dir, f"{abs_idx:06d}.json")
             if os.path.exists(existing_json) and not is_single:
                 if self._frame_has_prompts(local_frame_idx):
@@ -512,7 +528,6 @@ class Annotator:
                     n_skipped += 1
                     current_step += 1
                     continue
-            frame_path = self.media_files[local_frame_idx]
             self.idx_to_path[abs_idx] = frame_path
             self.masks[abs_idx] = {}
             try:
@@ -525,7 +540,15 @@ class Annotator:
             except Exception as e:
                 print(f"Error applying mask for frame {local_frame_idx}: {e}")
         self.tracking_results = {}
-        if n_added > 0:
+        if merge and n_added > 0:
+            # Merge mode: JSONs already written, just update state
+            self._json_frames = getattr(self, '_json_frames', set()) | merged_idxs
+            self.overlay_imgs = {}
+            self.combined_masks = {}
+            self.mode = "correction"
+            self.view_mode = "overlay"
+            import gc; gc.collect()
+        elif n_added > 0:
             # auto-export JSON and free memory
             update_progress_callback("Exporting JSON...", 90)
             os.makedirs(os.path.join(self.project_dir, "jsons"), exist_ok=True)
@@ -604,7 +627,69 @@ class Annotator:
                     if li >= 0:
                         self.sam_handler.labels[li].prop_frames[self.current_block].add(k)
         return True, list(self.tracking_results.keys())
-    
+
+    def propagate_single_label(self, group_id, direction, update_progress_callback):
+        """Propagate only one label. direction: 1=forward, -1=backward, 0=both."""
+        self.tracking_results = self.sam_handler.propagate_single_label(
+            group_id, self.curr_img_idx, direction, update_progress_callback)
+        if not self.tracking_results:
+            self.mode = "prompts"
+            return False, []
+        # Update prop_frames for this label
+        li = self.get_label_idx_by_group_id(group_id)
+        if li >= 0:
+            pf = self.sam_handler.labels[li].prop_frames.setdefault(self.current_block, set())
+            for k in self.tracking_results:
+                pf.add(k)
+        return True, list(self.tracking_results.keys())
+
+    def _merge_mask_to_json(self, abs_idx, group_id, mask_bin, frame_path):
+        """Merge a single label's mask into the existing JSON for this frame.
+        Other labels' shapes are preserved."""
+        import json as _json
+        json_dir = os.path.join(self.project_dir, "jsons")
+        os.makedirs(json_dir, exist_ok=True)
+        json_path = os.path.join(json_dir, f"{abs_idx:06d}.json")
+        img_h, img_w = mask_bin.shape[:2]
+        # Read existing JSON or create template
+        if os.path.exists(json_path):
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = _json.load(f)
+        else:
+            data = {
+                "version": "5.0.1", "flags": {},
+                "shapes": [],
+                "imagePath": f"{abs_idx:06d}.jpg",
+                "imageData": None,
+                "imageHeight": int(img_h), "imageWidth": int(img_w)
+            }
+        # Remove old shapes for this group_id
+        data["shapes"] = [s for s in data.get("shapes", [])
+                          if s.get("group_id") != group_id]
+        # Convert mask to contour polygons
+        mask_u8 = mask_bin.astype(np.uint8) * 255
+        cnts, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        label_name = None
+        for lbl in self.sam_handler.labels:
+            if lbl.group_id == group_id:
+                label_name = lbl.name
+                break
+        if label_name is None:
+            label_name = f"label_{group_id}"
+        for c in cnts:
+            if cv2.contourArea(c) <= 50:
+                continue
+            points = c.reshape(-1, 2).tolist()
+            data["shapes"].append({
+                "label": label_name,
+                "points": points,
+                "group_id": group_id,
+                "shape_type": "polygon",
+                "flags": {}
+            })
+        with open(json_path, 'w', encoding='utf-8') as f:
+            _json.dump(data, f, ensure_ascii=False, indent=2)
+
     # AUTO-PROMPTING ~ DONE
     
     def keep_largest_connected_region(self,mask):

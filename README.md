@@ -4,6 +4,11 @@
 
 你可以用这个工具在视频中标注物体，SAM2 会自动把标注传播到其他帧，最终导出 LabelMe 格式的 JSON 分割结果。
 
+### v1.4.0 更新 (2026-04-15)
+
+- **Single Label Mode**：新增增量传播模式，勾选后 Forward/Backward/All 只推理选中的 label，结果合并到已有标注中，其他 label 不受影响
+- **Ctrl+S** 快捷键一键保存 session
+
 ### v1.3.0 更新 (2026-04-14)
 
 - **UI 重构**：顶部改为菜单栏（File / Edit / Settings），界面更简洁
@@ -280,6 +285,7 @@ python main.py
 - **Forward**：从当前帧往后传播到 checkpoint 或 block 末尾
 - **Backward**：从当前帧往前传播到 checkpoint 或 block 开头
 - **All**：向前向后都传播
+- **Single Label Mode**（复选框）：勾选后，Forward/Backward/All 只传播当前选中的 label，结果合并到已有 JSON 中，不覆盖其他 label 的标注。适用于先标注 A 再追加 B 的场景
 - **Checkpoint**：在当前帧设置/取消传播断点，Forward/Backward 会停在 checkpoint 处
 
 > 推理时按钮会变灰，等进度条跑完再操作。
@@ -324,6 +330,7 @@ python main.py
 | `Delete` | 删除选中的标注 |
 | `Shift+1/2/3/4` | 切换视图模式（Original/Prompt/Overlay/Mask） |
 | `F11` | 全屏 / 退出全屏 |
+| `Ctrl+S` | 保存 session |
 | `Esc` | 清除输入框焦点（恢复快捷键） |
 | 鼠标左键 | 前景点（绿色） |
 | 鼠标右键 | 背景点（红色） |

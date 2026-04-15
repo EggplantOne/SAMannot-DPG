@@ -424,6 +424,116 @@ class SAM_Annotator:
             return {}
         finally:
             self.predictor.reset_state(self.inference_state)
+
+    @torch.inference_mode()
+    def propagate_single_label(self, group_id, start_frame_idx, direction=0, progress_callback=None):
+        """Propagate only the specified label (by group_id).
+        direction: 1=forward, -1=backward, 0=both.
+        start_frame_idx: current frame (propagation origin).
+        Returns {frame_idx: {group_id: mask_array}} — same format as propagate()."""
+        if not self.tracking_init:
+            print("Tracking not initialized!")
+            return {}
+        try:
+            total_frames = len(self.media_files)
+            # Find the target label
+            target_label = None
+            for label in self.labels:
+                if label.group_id == group_id:
+                    target_label = label
+                    break
+            if target_label is None:
+                print(f"Label with group_id={group_id} not found")
+                return {}
+            # Collect prompts for this label
+            frames_data = {}
+            for pt in target_label.pts.get(self.current_block, []):
+                if pt.idx not in frames_data:
+                    frames_data[pt.idx] = {"pts": [], "labels": [], "boxes": []}
+                frames_data[pt.idx]["pts"].append([pt.x, pt.y])
+                frames_data[pt.idx]["labels"].append(pt.pt_type)
+            for box in target_label.boxes.get(self.current_block, []):
+                if box.idx not in frames_data:
+                    frames_data[box.idx] = {"pts": [], "labels": [], "boxes": []}
+                frames_data[box.idx]["boxes"].append([box.fx, box.fy, box.x, box.y])
+            if not frames_data:
+                print(f"No prompts for label '{target_label.name}'")
+                return {}
+            # Reset state and add only this label's prompts
+            self.predictor.reset_state(self.inference_state)
+            obj_id = self._get_object_id(group_id)
+            with torch.autocast(self.device.type, dtype=self.autocast_dtype):
+                for frame_idx in sorted(frames_data.keys()):
+                    data = frames_data[frame_idx]
+                    pts = np.array(data["pts"]) if data["pts"] else None
+                    lbls = np.array(data["labels"]) if data["labels"] else None
+                    bx = np.array(data["boxes"][0]) if data["boxes"] else None
+                    self.predictor.add_new_points_or_box(
+                        inference_state=self.inference_state,
+                        frame_idx=frame_idx,
+                        obj_id=obj_id,
+                        points=pts, labels=lbls, box=bx
+                    )
+            results = {}
+            do_forward = direction >= 0   # 0 or 1
+            do_backward = direction <= 0  # 0 or -1
+            # Compute checkpoint-limited ranges (same logic as propagate())
+            ckpts = self.propagation_blocks.get(self.current_block, {})
+            # Forward limit: nearest checkpoint after start_frame_idx
+            fwd_end = total_frames
+            for k in ckpts:
+                if k > start_frame_idx and k < fwd_end:
+                    fwd_end = k
+            fwd_max_track = fwd_end - start_frame_idx
+            # Backward limit: nearest checkpoint before start_frame_idx
+            bwd_end = 0
+            for k in ckpts:
+                if k < start_frame_idx and k > bwd_end:
+                    bwd_end = k
+            bwd_max_track = start_frame_idx - bwd_end
+            # Forward propagation from start_frame_idx
+            if do_forward:
+                with torch.autocast(self.device.type, dtype=self.autocast_dtype):
+                    for i, (out_frame_idx, _, out_mask_logits) in enumerate(
+                            self.predictor.propagate_in_video(
+                                self.inference_state,
+                                start_frame_idx=start_frame_idx,
+                                max_frame_num_to_track=fwd_max_track,
+                                reverse=False)):
+                        mask = (out_mask_logits[0] > 0.0).cpu().numpy()
+                        results[out_frame_idx] = {group_id: mask}
+                        if progress_callback:
+                            pct = (i / max(1, fwd_max_track)) * (50 if do_backward else 100)
+                            progress_callback(f"Propagating '{target_label.name}' (forward)...", pct)
+            # Backward propagation from start_frame_idx
+            if do_backward and start_frame_idx > 0:
+                with torch.autocast(self.device.type, dtype=self.autocast_dtype):
+                    for i, (out_frame_idx, _, out_mask_logits) in enumerate(
+                            self.predictor.propagate_in_video(
+                                self.inference_state,
+                                start_frame_idx=start_frame_idx,
+                                max_frame_num_to_track=bwd_max_track,
+                                reverse=True)):
+                        if out_frame_idx not in results:
+                            mask = (out_mask_logits[0] > 0.0).cpu().numpy()
+                            results[out_frame_idx] = {group_id: mask}
+                        if progress_callback:
+                            base = 50 if do_forward else 0
+                            pct = base + (i / max(1, bwd_max_track)) * 50
+                            progress_callback(f"Propagating '{target_label.name}' (backward)...", pct)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            return results
+        except Exception as e:
+            print(f"Error in propagate_single_label: {e}")
+            import traceback
+            traceback.print_exc()
+            if progress_callback:
+                progress_callback(f"Error: {e}", 0)
+            return {}
+        finally:
+            self.predictor.reset_state(self.inference_state)
+
     def propagate_to_all(self, current_frame_idx, start_frame_idx = None, end_frame_idx = None, progress_callback = None, flag = 1):
         forward_prop_results = self.propagate(1,current_frame_idx,end_frame_idx,progress_callback,flag)
         backward_prop_results = self.propagate(-1,current_frame_idx,start_frame_idx,progress_callback,flag)

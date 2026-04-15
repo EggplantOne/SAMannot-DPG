@@ -743,18 +743,36 @@ def _init_tracking_if_needed():
     return True
 
 
+def _is_single_label_mode():
+    """Check if the 'Single Label' checkbox is enabled."""
+    try:
+        return dpg.get_value("chk_single_label")
+    except Exception:
+        return False
+
+
 def cb_forward(sender, app_data):
     if not _check_inference_ready():
         return
     def task():
         if not _init_tracking_if_needed():
             return
-        _show_progress("Propagating forward...", 10)
-        success, frames = ann.propagate(1, _progress_callback)
+        if _is_single_label_mode():
+            if ann.curr_label_idx < 0:
+                _show_progress("No label selected.", 0); return
+            label = ann.sam_handler.labels[ann.curr_label_idx]
+            _show_progress(f"Forward '{label.name}'...", 10)
+            success, frames = ann.propagate_single_label(label.group_id, 1, _progress_callback)
+            merge = True
+        else:
+            _show_progress("Propagating forward...", 10)
+            success, frames = ann.propagate(1, _progress_callback)
+            merge = False
         if success:
-            ann.apply_masks(_progress_callback)
+            ann.apply_masks(_progress_callback, merge=merge)
             ann.view_mode = "overlay"
             load_and_show_frame()
+            _draw_timeline()
             _show_progress("Forward done.", 100)
         else:
             _show_progress("Forward propagation failed.", 0)
@@ -767,12 +785,22 @@ def cb_backward(sender, app_data):
     def task():
         if not _init_tracking_if_needed():
             return
-        _show_progress("Propagating backward...", 10)
-        success, frames = ann.propagate(-1, _progress_callback)
+        if _is_single_label_mode():
+            if ann.curr_label_idx < 0:
+                _show_progress("No label selected.", 0); return
+            label = ann.sam_handler.labels[ann.curr_label_idx]
+            _show_progress(f"Backward '{label.name}'...", 10)
+            success, frames = ann.propagate_single_label(label.group_id, -1, _progress_callback)
+            merge = True
+        else:
+            _show_progress("Propagating backward...", 10)
+            success, frames = ann.propagate(-1, _progress_callback)
+            merge = False
         if success:
-            ann.apply_masks(_progress_callback)
+            ann.apply_masks(_progress_callback, merge=merge)
             ann.view_mode = "overlay"
             load_and_show_frame()
+            _draw_timeline()
             _show_progress("Backward done.", 100)
         else:
             _show_progress("Backward propagation failed.", 0)
@@ -785,12 +813,22 @@ def cb_all(sender, app_data):
     def task():
         if not _init_tracking_if_needed():
             return
-        _show_progress("Propagating all...", 10)
-        success, frames = ann.propagate(0, _progress_callback)
+        if _is_single_label_mode():
+            if ann.curr_label_idx < 0:
+                _show_progress("No label selected.", 0); return
+            label = ann.sam_handler.labels[ann.curr_label_idx]
+            _show_progress(f"All '{label.name}'...", 10)
+            success, frames = ann.propagate_single_label(label.group_id, 0, _progress_callback)
+            merge = True
+        else:
+            _show_progress("Propagating all...", 10)
+            success, frames = ann.propagate(0, _progress_callback)
+            merge = False
         if success:
-            ann.apply_masks(_progress_callback)
+            ann.apply_masks(_progress_callback, merge=merge)
             ann.view_mode = "overlay"
             load_and_show_frame()
+            _draw_timeline()
             _show_progress("All done.", 100)
         else:
             _show_progress("Propagation failed.", 0)
@@ -976,7 +1014,13 @@ def cb_key_handler(sender, app_data):
     if _is_input_focused():
         return
 
+    ctrl = dpg.is_key_down(dpg.mvKey_LControl) or dpg.is_key_down(dpg.mvKey_RControl)
     shift = dpg.is_key_down(dpg.mvKey_LShift) or dpg.is_key_down(dpg.mvKey_RShift)
+
+    if ctrl:
+        if key == dpg.mvKey_S:
+            cb_save_session(None, None)
+            return
 
     if shift:
         # Shift+1/2/3/4 → view mode
@@ -1954,6 +1998,8 @@ def build_ui():
                                        tag="btn_backward", width=105)
                         dpg.add_button(label="All", callback=cb_all,
                                        tag="btn_all", width=105)
+                    dpg.add_checkbox(label="Single Label Mode", tag="chk_single_label",
+                                     default_value=False)
                     dpg.add_button(label="Checkpoint", callback=cb_toggle_checkpoint,
                                    tag="btn_checkpoint", width=-1)
                     dpg.add_text("", tag="progress_text", wrap=PANEL_W - 30)
