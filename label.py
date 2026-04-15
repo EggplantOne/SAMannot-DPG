@@ -72,7 +72,12 @@ class Label_Handler:
                 b = b | (bitget(c, 2) << 7-j)
                 c = c >> 3
             cmap[i] = np.array([b, g, r])
-        return cmap[1:]
+        cmap = cmap[1:]
+        # Move red-dominant colors to the end (red confuses with tissue in surgical video)
+        # cmap is BGR: c[2]=R, c[1]=G, c[0]=B
+        non_red = [c for c in cmap if not (c[2] > 100 and c[2] > c[1] * 1.5 and c[2] > c[0] * 1.5)]
+        reds = [c for c in cmap if (c[2] > 100 and c[2] > c[1] * 1.5 and c[2] > c[0] * 1.5)]
+        return np.array(non_red + reds)
     def convert_to_hexadecimal(self,colour):
         return f'#{colour[2]:02x}{colour[1]:02x}{colour[0]:02x}'
     def create_new_label(self,name):

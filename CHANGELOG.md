@@ -7,6 +7,10 @@
   - 适用于"先标注器械 A 再追加器械 B"的增量标注场景，无需重跑所有 label
 - **Ctrl+S** 快捷键一键保存 session
 
+### Changed
+- 标签调色板红色后移：前几个 label 不再分配红色（手术视频中红色 mask 易与组织混淆），红色系移至调色板末尾
+
+
 ### Fixed
 - 修复 Single Label Mode 下传播不受 Checkpoint 限制的问题（现在与正常模式一致，前向停在下一个 checkpoint，反向停在上一个）
 
