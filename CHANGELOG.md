@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.4.1] - 2026-04-18
+### Fixed
+- 修复 Reassign Label 后删除旧标签导致 mask 变白的问题（reassign 只更新了磁盘 JSON 的 group_id，未同步迁移内存中的 mask 数据，删除旧标签时内存 mask 被一并清除）
+
 ## [1.4.0] - 2026-04-15
 ### Added
 - 新增 **Single Label Mode** 开关（SAM2 Inference 区域的复选框）

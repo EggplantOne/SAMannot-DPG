@@ -393,7 +393,22 @@ class Annotator:
                         json.dump(data, f, ensure_ascii=False, indent=2)
                     n_modified += 1
 
-        # 2. Move prompts (pts and boxes) between labels
+        # 2. Move in-memory masks from src to dst
+        for abs_idx in range(start_abs, end_abs + 1):
+            if abs_idx not in self.masks:
+                continue
+            frame_masks = self.masks[abs_idx]
+            if src_group_id not in frame_masks:
+                continue
+            src_mask = frame_masks.pop(src_group_id)
+            if dst_group_id in frame_masks:
+                dst_arr = frame_masks[dst_group_id].astype(bool)
+                src_arr = src_mask.astype(bool)
+                frame_masks[dst_group_id] = PackedMasks(dst_arr | src_arr)
+            else:
+                frame_masks[dst_group_id] = src_mask
+
+        # 3. Move prompts (pts and boxes) between labels
         for block_idx in range(self.num_blocks):
             block_start = block_idx * self.block_size
             block_end = block_start + self.block_size - 1
