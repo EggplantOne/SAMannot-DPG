@@ -697,7 +697,17 @@ def cb_single(sender, app_data):
         success, prop_frames = ann.generate_mask()
         if success:
             _show_progress("Applying masks...", 50)
-            ann.apply_masks(_progress_callback, is_single=True)
+            if _is_single_label_mode():
+                # Only keep the selected label's result, merge into existing JSON
+                selected_gid = ann.sam_handler.labels[ann.curr_label_idx].group_id
+                for fidx in list(ann.tracking_results.keys()):
+                    ann.tracking_results[fidx] = {
+                        gid: m for gid, m in ann.tracking_results[fidx].items()
+                        if gid == selected_gid
+                    }
+                ann.apply_masks(_progress_callback, merge=True)
+            else:
+                ann.apply_masks(_progress_callback, is_single=True)
             ann.view_mode = "overlay"
             load_and_show_frame()
             _show_progress("Single done.", 100)
