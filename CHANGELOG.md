@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.3] - 2026-04-20
+### Changed
+- Prompts 视图下前景点颜色改为跟随 label 自身颜色（与 mask 颜色一致），背景点保持红色
+
+### Fixed
+- 修复 Reassign Label 后删除旧标签导致 mask 变白的问题（reassign 只更新了磁盘 JSON，未同步迁移内存中的 mask 数据）
+
 ## [1.4.2] - 2026-04-19
 ### Fixed
 - 修复 Single Label Mode 下 Single 按钮覆盖其他 label mask 的问题（勾选 Single Label Mode 时，Single 按钮现在只更新选中 label 的结果，合并写入已有 JSON，不再冲掉其他 label 的标注）

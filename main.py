@@ -319,7 +319,7 @@ def draw_overlays():
             if pt.idx != frame_idx:
                 continue
             dx, dy = img_to_display(pt.x, pt.y)
-            col = (0, 255, 0, 255) if pt.pt_type == 1 else (255, 0, 0, 255)
+            col = label_color if pt.pt_type == 1 else (255, 0, 0, 255)
             dpg.draw_circle((dx, dy), 6, color=col, fill=col, parent=OVERLAY_NODE)
             dpg.draw_text((dx + 8, dy - 8), str(li), color=label_color, size=14,
                           parent=OVERLAY_NODE)
