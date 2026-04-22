@@ -334,8 +334,8 @@ class Annotator:
     
     # LABEL AND PROMPT HANDLING
     
-    def add_label(self,label_name):
-        new_label = self.label_handler.create_new_label(label_name)
+    def add_label(self, label_name, group_id=None, color=None):
+        new_label = self.label_handler.create_new_label(label_name, group_id=group_id, color=color)
         for i in range(self.num_blocks):
             new_label.pts[i] = []
         for i in range(self.num_blocks):

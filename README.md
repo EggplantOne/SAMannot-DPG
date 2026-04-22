@@ -4,17 +4,12 @@
 
 你可以用这个工具在视频中标注物体，SAM2 会自动把标注传播到其他帧，最终导出 LabelMe 格式的 JSON 分割结果。
 
-### v1.4.0 更新 (2026-04-15)
+### v1.5.0 更新 (2026-04-22)
 
-- **Single Label Mode**：新增增量传播模式，勾选后 Forward/Backward/All 只推理选中的 label，结果合并到已有标注中，其他 label 不受影响
-- **Ctrl+S** 快捷键一键保存 session
-
-### v1.3.0 更新 (2026-04-14)
-
-- **UI 重构**：顶部改为菜单栏（File / Edit / Settings），界面更简洁
-- **批量重分配标签**：Edit → Reassign Label，可在指定帧范围内将标注从一个标签转移到另一个标签
-- **抽帧质量选择**：Pre-extract 时可选 Standard 或 High Quality，显示预估磁盘占用
-- **Intel XPU 精度修复**：修复 Intel 核显上推理结果不准的问题
+- **Reconcile Labels**（Edit 菜单）：修复 mask 变白问题。扫描 JSON 自动修正 group_id 不一致，支持旧版 JSON 兼容（`group_id=None` 自动分配），可自定义 Block Size
+- **Load Folder 自动恢复**：Load Folder 时自动检测已有 session，直接恢复到上次工作位置
+- **group_id 语义修正**：对齐 LabelMe 标准，`group_id` 改为实例 ID，支持同名 label 多实例标注
+- **跨 block 保持 overlay 模式**：切换 block 不再重置为 prompts 视图
 
 ---
 

@@ -352,7 +352,7 @@ def save_label_presets(presets):
 def refresh_label_listbox():
     items = []
     for i, label in enumerate(ann.sam_handler.labels):
-        items.append(f"{i}: {label.name}")
+        items.append(f"{i}: {label.name} #{label.group_id}")
     dpg.configure_item("label_listbox", items=items)
     if 0 <= ann.curr_label_idx < len(items):
         dpg.set_value("label_listbox", items[ann.curr_label_idx])
@@ -496,8 +496,11 @@ def _cb_lib_apply(sender, app_data, user_data):
         if checked and not exists:
             ann.add_label(name)
         elif not checked and exists:
-            idx = ann.get_label_idx(name)
-            if idx >= 0:
+            # remove all instances of this class name
+            while True:
+                idx = ann.get_label_idx(name)
+                if idx < 0:
+                    break
                 ann.remove_label(idx)
     dpg.delete_item("lib_window")
     refresh_label_listbox()
@@ -1236,6 +1239,7 @@ def _do_load_media(file_path, block_size):
         ann.set_img(0)
 
 
+
 def _extract_block_frames(block_idx, block_size, total):
     """Extract frames for a given block, with progress updates."""
     start = block_idx * block_size
@@ -1306,17 +1310,38 @@ def _on_file_selected(sender, app_data):
 
 
 def _on_folder_selected(sender, app_data):
-    """DPG file dialog callback for Load Folder."""
+    """DPG file dialog callback for Load Folder.
+    If a pkl session exists in the project dir, load it fully (= Load Session).
+    Otherwise, just load media frames."""
     folder = app_data.get("file_path_name", "")
     if not folder or not os.path.isdir(folder):
         return
-    block_size = int(dpg.get_value("block_size_input"))
 
-    def do_load():
-        global _media_load_done
-        _do_load_media(folder, block_size)
-        _media_load_done = True
-    threading.Thread(target=do_load, daemon=True).start()
+    # 推导 project_dir，检查是否有 pkl
+    folder_name = os.path.basename(folder)
+    if folder_name == "frames":
+        media_basename = os.path.basename(os.path.dirname(folder))
+    else:
+        media_basename = folder_name
+    project_dir = os.path.join("projects", media_basename)
+
+    pkl_path = None
+    if os.path.isdir(project_dir):
+        pkl_files = [f for f in os.listdir(project_dir) if f.endswith(".pkl")]
+        if len(pkl_files) == 1:
+            pkl_path = os.path.join(project_dir, pkl_files[0])
+
+    if pkl_path:
+        # 有 pkl → 走完整的 Load Session 流程
+        _load_session_from_path(pkl_path)
+    else:
+        # 没有 pkl → 正常加载 media
+        block_size = int(dpg.get_value("block_size_input"))
+        def do_load():
+            global _media_load_done
+            _do_load_media(folder, block_size)
+            _media_load_done = True
+        threading.Thread(target=do_load, daemon=True).start()
 
 
 def cb_load_media(sender, app_data):
@@ -1369,10 +1394,14 @@ def _reload_block():
         return
     block_size = ann.block_size
 
-    # reset tracking state when switching blocks (same as source project)
+    # reset tracking state when switching blocks, preserve view_mode
     target_block = ann.current_block
+    saved_view_mode = ann.view_mode
+    saved_mode = ann.mode
     ann.reset_media()
     ann.set_current_block(target_block)
+    ann.view_mode = saved_view_mode
+    ann.mode = saved_mode
 
     if ann.video_name and os.path.exists(ann.video_name):
         if _max_frame <= 0:
@@ -1404,17 +1433,208 @@ def cb_save_session(sender, app_data):
     _show_progress(f"Saved: {path}", 100)
 
 
-def _on_session_selected(sender, app_data):
-    """DPG file dialog callback for Load Session."""
-    selections = app_data.get("selections", {})
-    if not selections:
-        return
-    path = list(selections.values())[0]
+def _reconcile_session_group_ids():
+    """Load Session 后：扫描 JSON 文件，确保 pkl 的 group_id 和 JSON 一致。
+    如果不一致，pkl 适配 JSON（JSON 是落盘数据，pkl 迁就它）。"""
+    from collections import defaultdict
 
+    json_dir = os.path.join(ann.project_dir, "jsons")
+    if not os.path.isdir(json_dir):
+        return
+
+    # Step 1: 扫描 JSON，收集每个 name 的 group_id 集合 + 最后标注帧号
+    #         同时记录 group_id=None 的 name（旧版 JSON 兼���）
+    name_to_gids = defaultdict(set)
+    names_with_none_gid = set()  # name 出现过 group_id=None
+    last_annotated_frame = -1
+    json_files = [f for f in os.listdir(json_dir) if f.endswith(".json")]
+    if not json_files:
+        return
+    total_jsons = len(json_files)
+    _show_progress(f"Checking {total_jsons} JSON files...", 0)
+    for i, fname in enumerate(json_files):
+        fpath = os.path.join(json_dir, fname)
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            shapes = data.get("shapes", [])
+            if shapes:
+                try:
+                    frame_idx = int(os.path.splitext(fname)[0])
+                    last_annotated_frame = max(last_annotated_frame, frame_idx)
+                except ValueError:
+                    pass
+            for shape in shapes:
+                name = shape.get("label", "")
+                gid = shape.get("group_id")
+                if not name:
+                    continue
+                if gid is not None:
+                    name_to_gids[name].add(gid)
+                else:
+                    names_with_none_gid.add(name)
+        except Exception:
+            continue
+        if (i + 1) % 100 == 0 or i + 1 == total_jsons:
+            _show_progress(
+                f"Checking JSONs... {i+1}/{total_jsons}",
+                int((i + 1) / total_jsons * 100))
+
+    # 为 group_id=None 的 name 分配 gid（如果该 name 已有 gid 则复用，否则新分配）
+    next_gid = 1
+    all_existing_gids = set()
+    for gids in name_to_gids.values():
+        all_existing_gids.update(gids)
+    if all_existing_gids:
+        next_gid = max(all_existing_gids) + 1
+
+    none_gid_assigned = {}  # name → newly assigned gid
+    for name in names_with_none_gid:
+        if name in name_to_gids and name_to_gids[name]:
+            # 该 name 已有 gid，取最小的
+            none_gid_assigned[name] = min(name_to_gids[name])
+        elif name not in name_to_gids:
+            # 该 name 只出现过 group_id=None，分配新 gid
+            none_gid_assigned[name] = next_gid
+            name_to_gids[name].add(next_gid)
+            next_gid += 1
+
+    # 回写 JSON：把 group_id=None 修正为正确的数字
+    if none_gid_assigned:
+        _show_progress(f"Fixing {len(names_with_none_gid)} label(s) with missing group_id...", 0)
+        fixed_count = 0
+        for i, fname in enumerate(json_files):
+            fpath = os.path.join(json_dir, fname)
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                modified = False
+                for shape in data.get("shapes", []):
+                    if shape.get("group_id") is None:
+                        name = shape.get("label", "")
+                        if name in none_gid_assigned:
+                            shape["group_id"] = none_gid_assigned[name]
+                            modified = True
+                if modified:
+                    with open(fpath, "w", encoding="utf-8") as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    fixed_count += 1
+            except Exception:
+                continue
+            if (i + 1) % 100 == 0 or i + 1 == total_jsons:
+                _show_progress(
+                    f"Fixing JSONs... {i+1}/{total_jsons}",
+                    int((i + 1) / total_jsons * 100))
+        _show_progress(f"Fixed group_id in {fixed_count} JSON files.", 100)
+
+    if not name_to_gids:
+        return
+
+    # Step 2: pkl 适配 JSON — 按 name 分组，排序后一一对应
+    pkl_name_to_labels = defaultdict(list)
+    for label in ann.sam_handler.labels:
+        pkl_name_to_labels[label.name].append(label)
+
+    remap = {}  # old_pkl_gid → new_json_gid
+    errors = []
+
+    for name, labels in pkl_name_to_labels.items():
+        if name not in name_to_gids:
+            continue
+        pkl_gids = sorted([l.group_id for l in labels])
+        json_gids = sorted(name_to_gids[name])
+        if len(pkl_gids) != len(json_gids):
+            errors.append(
+                f"'{name}': pkl has {len(pkl_gids)} instance(s), "
+                f"JSON has {len(json_gids)} — please check")
+            continue
+        for old_gid, new_gid in zip(pkl_gids, json_gids):
+            if old_gid != new_gid:
+                remap[old_gid] = new_gid
+
+    # 记录需要添加的缺失 labels（remap 之后再添加，避免 gid 冲突）
+    missing = []  # [(name, gid), ...]
+    for name, gids in name_to_gids.items():
+        if name not in pkl_name_to_labels:
+            for gid in sorted(gids):
+                missing.append((name, gid))
+
+    if errors:
+        _show_progress("group_id mismatch: " + "; ".join(errors), 0)
+
+    if not remap and not missing:
+        if not errors:
+            _show_progress("Reconcile: group_ids already consistent.", 100)
+        return
+
+    # Step 3: 先执行 remap
+    if remap:
+        # 用临时负数 key 避免链式覆盖（如 1→3, 3→5）
+        tmp_remap = {old: -(i + 1) for i, old in enumerate(remap.keys())}
+        tmp_to_final = {-(i + 1): new for i, (old, new) in enumerate(remap.items())}
+
+        for label in ann.sam_handler.labels:
+            if label.group_id in remap:
+                label.group_id = remap[label.group_id]
+
+        for d in [ann.masks, ann.tracking_results]:
+            for frame_data in d.values():
+                for old_gid, tmp_gid in tmp_remap.items():
+                    if old_gid in frame_data:
+                        frame_data[tmp_gid] = frame_data.pop(old_gid)
+                for tmp_gid, final_gid in tmp_to_final.items():
+                    if tmp_gid in frame_data:
+                        frame_data[final_gid] = frame_data.pop(tmp_gid)
+
+        for obj_id in list(ann.sam_handler.object_id_to_group_id.keys()):
+            gid = ann.sam_handler.object_id_to_group_id[obj_id]
+            if gid in remap:
+                ann.sam_handler.object_id_to_group_id[obj_id] = remap[gid]
+
+    # Step 4: remap 完成后，添加缺失的 labels（此时不会有 gid 冲突）
+    added = []
+    for name, gid in missing:
+        ann.add_label(name, group_id=gid)
+        added.append(f"{name} #{gid}")
+
+    # 更新计数器
+    all_gids = set()
+    for gids in name_to_gids.values():
+        all_gids.update(gids)
+    if all_gids:
+        ann.label_handler._next_group_id = max(
+            ann.label_handler._next_group_id,
+            max(all_gids) + 1)
+
+    # 定位到最后一个有标注的帧（仅当 pkl 没有有效位置时）
+    if last_annotated_frame >= 0 and ann.curr_img_idx <= 0:
+        block_size = ann.block_size
+        if block_size > 0:
+            target_block = last_annotated_frame // block_size
+            frame_in_block = last_annotated_frame % block_size
+            ann.set_current_block(target_block)
+            ann.curr_img_idx = frame_in_block
+
+    # 保存修正后的 pkl
+    session_name = ann.session_name or "session"
+    pkl_path = os.path.join(ann.project_dir, f"{session_name}.pkl")
+    data = ann.compress_to_dict()
+    with open(pkl_path, "wb") as f:
+        pickle.dump(data, f)
+
+    parts = []
+    if remap:
+        parts.append(f"remapped {len(remap)} group_id(s)")
+    if added:
+        parts.append(f"added {len(added)} label(s): {', '.join(added)}")
+    _show_progress(f"Reconcile done: {'; '.join(parts)}. Session saved.", 100)
+
+
+def _load_session_from_path(path):
+    """Load a session pkl file. Used by both Load Session and Load Folder (when pkl found)."""
     def do_load():
-        global _max_frame
+        global _max_frame, _session_load_done
         import shutil as _shutil
-        import re
 
         _show_progress("Loading session...", 10)
         with open(path, "rb") as f:
@@ -1510,10 +1730,18 @@ def _on_session_selected(sender, app_data):
         ann.mode = "prompts"
 
         # signal main thread to refresh UI
-        global _session_load_done
         _session_load_done = True
 
     threading.Thread(target=do_load, daemon=True).start()
+
+
+def _on_session_selected(sender, app_data):
+    """DPG file dialog callback for Load Session."""
+    selections = app_data.get("selections", {})
+    if not selections:
+        return
+    path = list(selections.values())[0]
+    _load_session_from_path(path)
 
 
 def cb_load_session(sender, app_data):
@@ -1844,6 +2072,85 @@ def _cb_reassign_apply(sender, app_data):
     _hide_modal("reassign_modal")
 
 
+def _cb_reconcile_apply(sender, app_data):
+    """Run reconcile in a background thread."""
+    _hide_modal("reconcile_modal")
+    if not ann.media_files:
+        _show_progress("No media loaded. Load a folder or session first.", 0)
+        return
+    new_block_size = int(dpg.get_value("reconcile_block_size"))
+    def task():
+        global _session_load_done, _max_frame
+        import shutil as _shutil
+
+        # 应用新的 block_size
+        ann.block_size = new_block_size
+        frames_dir = ann.frames_dir
+        if os.path.isdir(frames_dir):
+            total = len([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
+        else:
+            total = _max_frame if _max_frame > 0 else 0
+        if total > 0:
+            ann.num_blocks = max(1, math.ceil(total / new_block_size))
+
+        _reconcile_session_group_ids()
+
+        # 重新加载刚保存的 pkl，确保帧、block 位置都正确
+        session_name = ann.session_name or "session"
+        pkl_path = os.path.join(ann.project_dir, f"{session_name}.pkl")
+        if not os.path.exists(pkl_path):
+            _session_load_done = True
+            return
+
+        with open(pkl_path, "rb") as f:
+            data = pickle.load(f)
+        ann.load_from_dict(data)
+
+        # 覆盖 pkl 里的 block_size（用户可能修改了）
+        ann.block_size = new_block_size
+        if total > 0:
+            ann.num_blocks = max(1, math.ceil(total / new_block_size))
+        if ann.current_block >= ann.num_blocks:
+            ann.current_block = max(0, ann.num_blocks - 1)
+
+        # 加载对应 block 的帧
+        block_size = ann.block_size
+        start_frame = ann.current_block * block_size
+        frames_dir = ann.frames_dir
+        expected_frame = os.path.join(frames_dir, f"{start_frame:06d}.jpg")
+
+        if os.path.exists(expected_frame):
+            end_frame = start_frame + block_size
+            total_on_disk = len([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
+            _max_frame = total_on_disk
+            end_frame = min(end_frame, total_on_disk)
+            extracted = []
+            for i in range(start_frame, end_frame):
+                fp = os.path.join(frames_dir, f"{i:06d}.jpg")
+                if os.path.exists(fp):
+                    extracted.append(fp)
+            ann.media_files = extracted
+            _shutil.rmtree(ann.sam_extract_dir, ignore_errors=True)
+            os.makedirs(ann.sam_extract_dir, exist_ok=True)
+            for fp in extracted:
+                dst = os.path.join(ann.sam_extract_dir, os.path.basename(fp))
+                if not os.path.exists(dst):
+                    _shutil.copy2(fp, dst)
+
+        if ann.media_files:
+            ann.set_img(min(ann.curr_img_idx, len(ann.media_files) - 1))
+
+        ann.sam_handler.tracking_init = False
+        ann.sam_handler.inference_state = None
+        ann.sam_handler.model_loaded = False
+        ann.sam_handler.model_loading = False
+        ann.sam_handler.current_stage = 0
+        ann.idx_to_path = {}
+
+        _session_load_done = True
+    threading.Thread(target=task, daemon=True).start()
+
+
 def _build_modal_dialogs():
     """Create modal dialog windows (hidden by default)."""
     # Pre-extract path dialog
@@ -1872,6 +2179,27 @@ def _build_modal_dialogs():
         with dpg.group(horizontal=True):
             dpg.add_button(label="Apply", callback=_cb_reassign_apply, width=100)
             dpg.add_button(label="Cancel", callback=lambda: _hide_modal("reassign_modal"), width=100)
+
+    # Reconcile Labels dialog
+    with dpg.window(label="Reconcile Labels", tag="reconcile_modal",
+                    modal=True, show=False, width=450, height=250, no_resize=True):
+        dpg.add_text("Scan all JSON annotation files and fix group_id\n"
+                     "mismatches between pkl session and JSON data.\n\n"
+                     "Use this when masks appear white after loading\n"
+                     "a session (group_id inconsistency).\n\n"
+                     "IMPORTANT: Delete any incorrectly annotated JSON\n"
+                     "files BEFORE running this (e.g. blocks annotated\n"
+                     "after a wrong Load Folder), otherwise the tool\n"
+                     "cannot distinguish errors from multi-instance labels.",
+                     wrap=430)
+        dpg.add_separator()
+        with dpg.group(horizontal=True):
+            dpg.add_text("Block Size:")
+            dpg.add_input_int(tag="reconcile_block_size", default_value=200, width=120,
+                              min_value=10, max_value=10000, min_clamped=True, max_clamped=True)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Run Reconcile", callback=_cb_reconcile_apply, width=130)
+            dpg.add_button(label="Cancel", callback=lambda: _hide_modal("reconcile_modal"), width=100)
 
     # Settings dialog
     with dpg.window(label="Settings", tag="settings_modal",
@@ -1963,6 +2291,7 @@ def build_ui():
                 dpg.add_menu_item(label="Reset", callback=cb_reset_session)
             with dpg.menu(label="Edit"):
                 dpg.add_menu_item(label="Reassign Label", callback=lambda: _show_modal("reassign_modal"))
+                dpg.add_menu_item(label="Reconcile Labels", callback=lambda: _show_modal("reconcile_modal"))
             dpg.add_menu_item(label="Settings", callback=lambda: _show_modal("settings_modal"))
             dpg.add_menu_item(label="<<", callback=cb_block_prev)
             dpg.add_menu_item(label=">>", callback=cb_block_next)

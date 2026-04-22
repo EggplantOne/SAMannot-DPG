@@ -80,9 +80,11 @@ class Label_Handler:
         return np.array(non_red + reds)
     def convert_to_hexadecimal(self,colour):
         return f'#{colour[2]:02x}{colour[1]:02x}{colour[0]:02x}'
-    def create_new_label(self,name):
-        label_colour = self.convert_to_hexadecimal(self.colour_map[self.current_label_idx%len(self.colour_map)])
-        self.current_label_idx += 1
-        gid = self._next_group_id
-        self._next_group_id += 1
-        return Label(name, label_colour, group_id=gid)
+    def create_new_label(self, name, group_id=None, color=None):
+        if color is None:
+            color = self.convert_to_hexadecimal(self.colour_map[self.current_label_idx % len(self.colour_map)])
+            self.current_label_idx += 1
+        if group_id is None:
+            group_id = self._next_group_id
+        self._next_group_id = max(self._next_group_id, group_id + 1)
+        return Label(name, color, group_id=group_id)

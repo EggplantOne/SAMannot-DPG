@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.5.0] - 2026-04-22
+### Added
+- **Reconcile Labels** 功能（Edit 菜单）：扫描项目 JSON 文件，自动修复 pkl 与 JSON 之间的 group_id 不一致问题（白色 mask），支持自定义 Block Size
+- **Load Folder 自动恢复 session**：Load Folder 时如果项目目录已有 pkl，自动走完整的 Load Session 流程，恢复 labels、帧位置和 block
+- group_id 语义修正：`group_id` 从类别 ID 改为实例 ID，对齐 LabelMe 标准（`label` = 类别名，`group_id` = 实例 ID）
+- 支持同名 label 多实例：可添加多个同名 label（如两把"抓钳"），UI 显示 `#group_id` 区分
+- `create_new_label()` 和 `add_label()` 支持传入 `group_id` 和 `color` 参数
+
+### Fixed
+- 修复跨 block 切换时 overlay 模式被自动重置为 prompts 的问题
+- Reconcile 兼容旧版 JSON（`group_id=None` 的 shape 自动分配正确的 group_id 并回写）
+- Reconcile 修复链式 remap 覆盖问题（如 1→3, 3→5 不再互相干扰）
+
+### Changed
+- Label Library 取消勾选时删除该类别的所有实例（之前只删第一个）
+- Label 列表显示格式从 `0: 抓钳` 改为 `0: 抓钳 #1`
+
 ## [1.4.3] - 2026-04-20
 ### Changed
 - Prompts 视图下前景点颜色改为跟随 label 自身颜色（与 mask 颜色一致），背景点保持红色
