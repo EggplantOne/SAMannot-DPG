@@ -352,7 +352,7 @@ def save_label_presets(presets):
 def refresh_label_listbox():
     items = []
     for i, label in enumerate(ann.sam_handler.labels):
-        items.append(f"{i}: {label.name} #{label.group_id}")
+        items.append(f"{i}: {label.name}")
     dpg.configure_item("label_listbox", items=items)
     if 0 <= ann.curr_label_idx < len(items):
         dpg.set_value("label_listbox", items[ann.curr_label_idx])
