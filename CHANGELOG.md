@@ -2,6 +2,7 @@
 
 ## [1.5.0] - 2026-04-22
 ### Added
+- **Delete Label in Range** 功能（Edit 菜单）：删除指定帧区间内某个 label 的 mask 和标注（JSON shapes、内存 mask、prompts、prop_frames），其他 label 不受影响
 - **Reconcile Labels** 功能（Edit 菜单）：扫描项目 JSON 文件，自动修复 pkl 与 JSON 之间的 group_id 不一致问题（白色 mask），支持自定义 Block Size
 - **Load Folder 自动恢复 session**：Load Folder 时如果项目目录已有 pkl，自动走完整的 Load Session 流程，恢复 labels、帧位置和 block
 - group_id 语义修正：`group_id` 从类别 ID 改为实例 ID，对齐 LabelMe 标准（`label` = 类别名，`group_id` = 实例 ID）

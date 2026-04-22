@@ -2041,12 +2041,51 @@ def _refresh_reassign_combos():
     dpg.configure_item("reassign_dst", items=items)
 
 
+# ── delete label in range ────────────────────────────────────────────────────
+
+def cb_delete_label_in_range(sender, app_data):
+    """Delete masks/prompts for a label within a frame range."""
+    if not ann.sam_handler.labels:
+        _show_progress("No labels to delete.", 0)
+        return
+    label_name = dpg.get_value("delete_range_label")
+    if not label_name:
+        _show_progress("Please select a label.", 0)
+        return
+    start_abs = dpg.get_value("delete_range_start")
+    end_abs = dpg.get_value("delete_range_end")
+    if start_abs > end_abs:
+        _show_progress("Start frame must be <= end frame.", 0)
+        return
+    label_idx = int(label_name.split(":")[0])
+    gid = ann.sam_handler.labels[label_idx].group_id
+    n = ann.delete_label_in_range(gid, start_abs, end_abs)
+    _show_progress(f"Deleted {n} frames of '{ann.sam_handler.labels[label_idx].name}' in [{start_abs}-{end_abs}]", 100)
+    load_and_show_frame()
+    _draw_timeline()
+
+
+def _cb_delete_range_apply(sender, app_data):
+    """Apply delete-in-range from modal."""
+    cb_delete_label_in_range(sender, app_data)
+    _hide_modal("delete_range_modal")
+
+
+def _refresh_delete_range_combo():
+    """Update the delete-range combo box with current labels."""
+    if not dpg.does_item_exist("delete_range_label"):
+        return
+    items = [f"{i}: {l.name}" for i, l in enumerate(ann.sam_handler.labels)]
+    dpg.configure_item("delete_range_label", items=items)
+
+
 # ── modal dialogs ────────────────────────────────────────────────────────────
 
 def _show_modal(tag):
     """Show a modal dialog window."""
     if dpg.does_item_exist(tag):
         _refresh_reassign_combos()
+        _refresh_delete_range_combo()
         dpg.configure_item(tag, show=True)
 
 
@@ -2180,6 +2219,22 @@ def _build_modal_dialogs():
             dpg.add_button(label="Apply", callback=_cb_reassign_apply, width=100)
             dpg.add_button(label="Cancel", callback=lambda: _hide_modal("reassign_modal"), width=100)
 
+    # Delete Label in Range dialog
+    with dpg.window(label="Delete Label in Range", tag="delete_range_modal",
+                    modal=True, show=False, width=350, height=160, no_resize=True):
+        dpg.add_text("Label to delete:")
+        dpg.add_combo(tag="delete_range_label", items=[], width=-1)
+        with dpg.group(horizontal=True):
+            dpg.add_text("Frames:")
+            dpg.add_input_int(tag="delete_range_start", default_value=0, width=100,
+                              min_value=0, min_clamped=True)
+            dpg.add_text("-")
+            dpg.add_input_int(tag="delete_range_end", default_value=0, width=100,
+                              min_value=0, min_clamped=True)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Apply", callback=_cb_delete_range_apply, width=100)
+            dpg.add_button(label="Cancel", callback=lambda: _hide_modal("delete_range_modal"), width=100)
+
     # Reconcile Labels dialog
     with dpg.window(label="Reconcile Labels", tag="reconcile_modal",
                     modal=True, show=False, width=450, height=250, no_resize=True):
@@ -2291,6 +2346,7 @@ def build_ui():
                 dpg.add_menu_item(label="Reset", callback=cb_reset_session)
             with dpg.menu(label="Edit"):
                 dpg.add_menu_item(label="Reassign Label", callback=lambda: _show_modal("reassign_modal"))
+                dpg.add_menu_item(label="Delete Label in Range", callback=lambda: _show_modal("delete_range_modal"))
                 dpg.add_menu_item(label="Reconcile Labels", callback=lambda: _show_modal("reconcile_modal"))
             dpg.add_menu_item(label="Settings", callback=lambda: _show_modal("settings_modal"))
             dpg.add_menu_item(label="<<", callback=cb_block_prev)

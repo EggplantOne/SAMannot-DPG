@@ -455,6 +455,72 @@ class Annotator:
 
         return n_modified
 
+    def delete_label_in_range(self, group_id, start_abs, end_abs):
+        """Delete masks and prompts for a label within [start_abs, end_abs]."""
+        target_label = None
+        for label in self.sam_handler.labels:
+            if label.group_id == group_id:
+                target_label = label
+                break
+        if not target_label:
+            return 0
+
+        n_modified = 0
+
+        # 1. Remove matching shapes from JSON files
+        json_dir = os.path.join(self.project_dir, "jsons")
+        if os.path.isdir(json_dir):
+            for abs_idx in range(start_abs, end_abs + 1):
+                json_path = os.path.join(json_dir, f"{abs_idx:06d}.json")
+                if not os.path.exists(json_path):
+                    continue
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                original_count = len(data.get("shapes", []))
+                data["shapes"] = [s for s in data.get("shapes", [])
+                                  if s.get("group_id") != group_id]
+                if len(data["shapes"]) < original_count:
+                    if len(data["shapes"]) == 0:
+                        os.remove(json_path)
+                    else:
+                        with open(json_path, 'w', encoding='utf-8') as f:
+                            json.dump(data, f, ensure_ascii=False, indent=2)
+                    n_modified += 1
+
+        # 2. Remove in-memory masks
+        for abs_idx in range(start_abs, end_abs + 1):
+            if abs_idx in self.masks and group_id in self.masks[abs_idx]:
+                del self.masks[abs_idx][group_id]
+
+        # 3. Remove prompts (pts and boxes) within the frame range
+        for block_idx in range(self.num_blocks):
+            block_start = block_idx * self.block_size
+            block_end = block_start + self.block_size - 1
+            if block_end < start_abs or block_start > end_abs:
+                continue
+            local_start = max(0, start_abs - block_start)
+            local_end = min(self.block_size - 1, end_abs - block_start)
+
+            # remove pts in range
+            pts = target_label.pts.get(block_idx, [])
+            if pts:
+                target_label.pts[block_idx] = [
+                    pt for pt in pts if not (local_start <= pt.idx <= local_end)]
+
+            # remove boxes in range
+            boxes = target_label.boxes.get(block_idx, [])
+            if boxes:
+                target_label.boxes[block_idx] = [
+                    box for box in boxes if not (local_start <= box.idx <= local_end)]
+
+            # 4. Remove prop_frames in range
+            pf = target_label.prop_frames.get(block_idx, set())
+            if pf:
+                target_label.prop_frames[block_idx] = {
+                    f for f in pf if not (local_start <= f <= local_end)}
+
+        return n_modified
+
     def add_feature_to_current_label(self,feature_name):
         current_label = self.sam_handler.labels[self.curr_label_idx]
         current_label.features.append([(feature_name, self.curr_img_idx + self.current_block * self.block_size)])
