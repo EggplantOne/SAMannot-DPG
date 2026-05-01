@@ -1,5 +1,5 @@
 import os
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import cv2  
 import time
 import numpy as np
@@ -963,10 +963,7 @@ class Annotator:
         for label_name, hex_col in drawn_labels.items():
             r, g, b = self.hex_to_rgb(hex_col)
             cv2.rectangle(blended, (8, legend_y - 14), (24, legend_y), (b, g, r), -1)
-            cv2.putText(blended, label_name, (30, legend_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(blended, label_name, (30, legend_y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+            self._put_text_pil(blended, label_name, (30, legend_y - 14), font_size=16)
             legend_y += 22
         return blended
 
@@ -1021,8 +1018,7 @@ class Annotator:
 
             # title: video/session name
             video_name = self.session_name or os.path.basename(self.project_dir)
-            cv2.putText(grid, video_name, (10, 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+            self._put_text_pil(grid, video_name, (10, 5), font_size=22)
 
             for i in range(grid_cols * grid_rows):
                 r, c = i // grid_cols, i % grid_cols
@@ -1116,10 +1112,7 @@ class Annotator:
                 for label_name, hex_col in drawn_labels.items():
                     r, g, b = self.hex_to_rgb(hex_col)
                     cv2.rectangle(frame, (8, legend_y - 14), (24, legend_y), (b, g, r), -1)
-                    cv2.putText(frame, label_name, (30, legend_y),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
-                    cv2.putText(frame, label_name, (30, legend_y),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+                    self._put_text_pil(frame, label_name, (30, legend_y - 14), font_size=16)
                     legend_y += 22
             writer.write(frame)
             if progress_callback and frame_idx % 100 == 0:
@@ -1320,6 +1313,38 @@ class Annotator:
     def hex_to_rgb(self, hex_color):
         hex_color = hex_color.lstrip('#')
         return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+    _pil_font_cache = {}
+
+    def _get_pil_font(self, size):
+        if size in self._pil_font_cache:
+            return self._pil_font_cache[size]
+        font = None
+        for name in ("msyh.ttc", "msyhbd.ttc", "simhei.ttf", "simsun.ttc"):
+            try:
+                font = ImageFont.truetype(name, size)
+                break
+            except OSError:
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+        self._pil_font_cache[size] = font
+        return font
+
+    def _put_text_pil(self, img_bgr, text, pos, font_size=16, fg_color=(0, 0, 0), outline_color=(255, 255, 255)):
+        """Draw Unicode text on a BGR numpy image using PIL. Draws outline + foreground for readability."""
+        pil_img = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+        draw = ImageDraw.Draw(pil_img)
+        font = self._get_pil_font(font_size)
+        x, y = pos
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                draw.text((x + dx, y + dy), text, font=font, fill=outline_color)
+        draw.text((x, y), text, font=font, fill=fg_color)
+        img_bgr[:] = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
     def _has_json(self, abs_idx):
         """Check if a JSON annotation file exists for this frame."""
         json_path = os.path.join(self.project_dir, "jsons", f"{abs_idx:06d}.json")

@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.5.1] - 2026-05-01
+### Fixed
+- 修复导出验证视频和 overlay 图片时中文 label 名称显示为 `????` 的问题（OpenCV putText 不支持非 ASCII 字符，改用 PIL 渲染文字，使用系统中文字体）
+
 ## [1.5.0] - 2026-04-22
 ### Added
 - **Delete Label in Range** 功能（Edit 菜单）：删除指定帧区间内某个 label 的 mask 和标注（JSON shapes、内存 mask、prompts、prop_frames），其他 label 不受影响
