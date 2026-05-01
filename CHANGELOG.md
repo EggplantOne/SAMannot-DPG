@@ -1,6 +1,9 @@
 # Changelog
 
 ## [1.5.1] - 2026-05-01
+### Changed
+- 导出验证视频和 overlay 图片时，label 名称直接标注在对应 mask 区域上方（使用 label 自身颜色 + 白色描边），取代之前左上角的小图例，更直观清晰
+
 ### Fixed
 - 修复导出验证视频和 overlay 图片时中文 label 名称显示为 `????` 的问题（OpenCV putText 不支持非 ASCII 字符，改用 PIL 渲染文字，使用系统中文字体）
 

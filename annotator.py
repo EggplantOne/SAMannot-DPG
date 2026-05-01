@@ -928,7 +928,7 @@ class Annotator:
         if img is None:
             return None
         overlay = img.copy()
-        drawn_labels = {}  # {display_name: hex_col}
+        shape_labels = []  # [(pts, label_name, rgb_tuple)]
         for shape in frame_json.get("shapes", []):
             label_name = shape.get("label", "")
             gid = shape.get("group_id", None)
@@ -951,20 +951,26 @@ class Annotator:
             pts = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
             cv2.fillPoly(overlay, [pts], colour)
             cv2.polylines(overlay, [pts], isClosed=True, color=colour, thickness=2)
-            drawn_labels[label_name] = hex_col
+            shape_labels.append((pts, label_name, (r, g, b)))
         blended = cv2.addWeighted(img, 0.55, overlay, 0.45, 0)
+        # label name near the largest polygon of each label (one text per label)
+        best = {}  # label_name -> (area, x, y, bw, bh, rgb)
+        for pts, label_name, rgb in shape_labels:
+            area = cv2.contourArea(pts)
+            if label_name not in best or area > best[label_name][0]:
+                x, y, bw, bh = cv2.boundingRect(pts)
+                best[label_name] = (area, x, y, bw, bh, rgb)
+        texts = []
+        for label_name, (_, x, y, bw, bh, rgb) in best.items():
+            tx = max(0, x + bw // 2 - len(label_name) * 5)
+            ty = max(0, y - 22)
+            texts.append((label_name, (tx, ty), rgb))
+        self._put_texts_pil(blended, texts, font_size=18)
         # frame number (large, bottom-left)
         cv2.putText(blended, f"Frame {abs_idx}", (10, blended.shape[0] - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 3, cv2.LINE_AA)
         cv2.putText(blended, f"Frame {abs_idx}", (10, blended.shape[0] - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 1, cv2.LINE_AA)
-        # legend
-        legend_y = 22
-        for label_name, hex_col in drawn_labels.items():
-            r, g, b = self.hex_to_rgb(hex_col)
-            cv2.rectangle(blended, (8, legend_y - 14), (24, legend_y), (b, g, r), -1)
-            self._put_text_pil(blended, label_name, (30, legend_y - 14), font_size=16)
-            legend_y += 22
         return blended
 
     def export_verification_overlays(self, num_samples=9):
@@ -1082,7 +1088,7 @@ class Annotator:
                 with open(json_files[frame_idx], 'r', encoding='utf-8') as f:
                     frame_json = json.load(f)
                 overlay = frame.copy()
-                drawn_labels = {}  # {display_name: hex_col}
+                shape_labels = []  # [(pts, label_name, rgb_tuple)]
                 for shape in frame_json.get("shapes", []):
                     label_name = shape.get("label", "")
                     gid = shape.get("group_id", None)
@@ -1105,15 +1111,21 @@ class Annotator:
                     pts = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
                     cv2.fillPoly(overlay, [pts], colour)
                     cv2.polylines(overlay, [pts], True, colour, 2)
-                    drawn_labels[label_name] = hex_col
+                    shape_labels.append((pts, label_name, (r, g, b)))
                 frame = cv2.addWeighted(frame, 0.35, overlay, 0.65, 0)
-                # legend
-                legend_y = 22
-                for label_name, hex_col in drawn_labels.items():
-                    r, g, b = self.hex_to_rgb(hex_col)
-                    cv2.rectangle(frame, (8, legend_y - 14), (24, legend_y), (b, g, r), -1)
-                    self._put_text_pil(frame, label_name, (30, legend_y - 14), font_size=16)
-                    legend_y += 22
+                # label name near the largest polygon of each label
+                best = {}
+                for pts, label_name, rgb in shape_labels:
+                    area = cv2.contourArea(pts)
+                    if label_name not in best or area > best[label_name][0]:
+                        x, y, bw, bh = cv2.boundingRect(pts)
+                        best[label_name] = (area, x, y, bw, bh, rgb)
+                texts = []
+                for label_name, (_, x, y, bw, bh, rgb) in best.items():
+                    tx = max(0, x + bw // 2 - len(label_name) * 5)
+                    ty = max(0, y - 22)
+                    texts.append((label_name, (tx, ty), rgb))
+                self._put_texts_pil(frame, texts, font_size=18)
             writer.write(frame)
             if progress_callback and frame_idx % 100 == 0:
                 progress_callback(frame_idx, total_frames)
@@ -1333,16 +1345,24 @@ class Annotator:
 
     def _put_text_pil(self, img_bgr, text, pos, font_size=16, fg_color=(0, 0, 0), outline_color=(255, 255, 255)):
         """Draw Unicode text on a BGR numpy image using PIL. Draws outline + foreground for readability."""
+        self._put_texts_pil(img_bgr, [(text, pos, fg_color)], font_size=font_size, outline_color=outline_color)
+
+    def _put_texts_pil(self, img_bgr, texts, font_size=16, outline_color=(255, 255, 255)):
+        """Draw multiple Unicode texts on a BGR image with a single PIL conversion.
+        texts: list of (text, (x, y), fg_color_rgb)"""
+        if not texts:
+            return
         pil_img = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
         draw = ImageDraw.Draw(pil_img)
         font = self._get_pil_font(font_size)
-        x, y = pos
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                if dx == 0 and dy == 0:
-                    continue
-                draw.text((x + dx, y + dy), text, font=font, fill=outline_color)
-        draw.text((x, y), text, font=font, fill=fg_color)
+        for text, pos, fg_color in texts:
+            x, y = pos
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    if dx == 0 and dy == 0:
+                        continue
+                    draw.text((x + dx, y + dy), text, font=font, fill=outline_color)
+            draw.text((x, y), text, font=font, fill=fg_color)
         img_bgr[:] = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
     def _has_json(self, abs_idx):
