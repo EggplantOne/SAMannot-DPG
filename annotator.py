@@ -361,6 +361,9 @@ class Annotator:
         return True
     def reassign_label_in_range(self, src_group_id, dst_group_id, start_abs, end_abs):
         """Move masks and prompts from src label to dst label within [start_abs, end_abs]."""
+        print(f"[reassign] src_gid={src_group_id} (type={type(src_group_id).__name__}), "
+              f"dst_gid={dst_group_id} (type={type(dst_group_id).__name__}), "
+              f"range=[{start_abs}, {end_abs}]")
         src_label = dst_label = None
         for label in self.sam_handler.labels:
             if label.group_id == src_group_id:
@@ -368,32 +371,45 @@ class Annotator:
             if label.group_id == dst_group_id:
                 dst_label = label
         if not src_label or not dst_label:
+            print(f"[reassign] label not found! src_label={src_label}, dst_label={dst_label}")
             return 0
 
         dst_name = dst_label.name
-        n_modified = 0
+        modified_frames = set()
 
         # 1. Update JSON files
         json_dir = os.path.join(self.project_dir, "jsons")
+        print(f"[reassign] json_dir={json_dir}, exists={os.path.isdir(json_dir)}")
         if os.path.isdir(json_dir):
+            n_json_files = 0
             for abs_idx in range(start_abs, end_abs + 1):
                 json_path = os.path.join(json_dir, f"{abs_idx:06d}.json")
                 if not os.path.exists(json_path):
                     continue
+                n_json_files += 1
                 with open(json_path, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 changed = False
                 for shape in data.get("shapes", []):
-                    if shape.get("group_id") == src_group_id:
+                    shape_gid = shape.get("group_id")
+                    if shape_gid == src_group_id:
                         shape["group_id"] = dst_group_id
                         shape["label"] = dst_name
                         changed = True
+                    elif abs_idx == start_abs and not changed:
+                        # print first non-matching shape for debug
+                        print(f"[reassign] frame {abs_idx}: shape group_id={shape_gid} "
+                              f"(type={type(shape_gid).__name__}) != src {src_group_id} "
+                              f"(type={type(src_group_id).__name__})")
                 if changed:
                     with open(json_path, 'w', encoding='utf-8') as f:
                         json.dump(data, f, ensure_ascii=False, indent=2)
-                    n_modified += 1
+                    modified_frames.add(abs_idx)
+
+            print(f"[reassign] json: found {n_json_files} json files in range, matched {len(modified_frames)} frames")
 
         # 2. Move in-memory masks from src to dst
+        print(f"[reassign] in-memory masks count: {len(self.masks)}")
         for abs_idx in range(start_abs, end_abs + 1):
             if abs_idx not in self.masks:
                 continue
@@ -407,6 +423,7 @@ class Annotator:
                 frame_masks[dst_group_id] = PackedMasks(dst_arr | src_arr)
             else:
                 frame_masks[dst_group_id] = src_mask
+            modified_frames.add(abs_idx)
 
         # 3. Move prompts (pts and boxes) between labels
         for block_idx in range(self.num_blocks):
@@ -453,7 +470,7 @@ class Annotator:
                 src_label.prop_frames[block_idx] = src_pf - frames_to_move
                 dst_label.prop_frames[block_idx] = dst_pf | frames_to_move
 
-        return n_modified
+        return len(modified_frames)
 
     def delete_label_in_range(self, group_id, start_abs, end_abs):
         """Delete masks and prompts for a label within [start_abs, end_abs]."""

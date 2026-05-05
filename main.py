@@ -47,6 +47,11 @@ _dpg_ready = False
 _session_load_done = False
 _media_load_done = False
 
+# Thread-safe UI update queue (DPG is NOT thread-safe)
+_main_thread_id = threading.get_ident()
+_pending_progress = None          # (msg, pct) or None
+_pending_session_name = None      # str or None
+
 LABEL_PRESETS_FILE = "label_presets.json"
 
 # ── coordinate helpers ───────────────────────────────────────────────────────
@@ -650,7 +655,12 @@ def _update_inference_buttons():
 
 
 def _show_progress(msg, pct=0):
+    global _pending_progress
     if not _dpg_ready:
+        return
+    if threading.get_ident() != _main_thread_id:
+        # Off main thread: defer to render loop
+        _pending_progress = (msg, pct)
         return
     try:
         dpg.set_value("progress_bar", pct / 100.0)
@@ -1014,7 +1024,8 @@ def cb_jump_next_prompt():
 
 def _is_input_focused():
     for tag in ("label_name_input", "block_size_input", "session_name_input",
-                 "preextract_path_input", "reassign_start", "reassign_end"):
+                 "preextract_path_input", "reassign_start", "reassign_end",
+                 "goto_frame_input"):
         if dpg.does_item_exist(tag) and dpg.is_item_focused(tag):
             return True
     return False
@@ -1070,10 +1081,40 @@ def cb_key_handler(sender, app_data):
         cb_undo_last_prompt()
     elif key == dpg.mvKey_Delete:
         cb_delete_selected_prompt()
+    elif key == dpg.mvKey_G:
+        cb_goto_frame_dialog()
     elif key == dpg.mvKey_F11:
         cb_toggle_fullscreen()
     elif key == dpg.mvKey_Escape:
         dpg.focus_item("primary_window")
+
+
+def cb_goto_frame_dialog():
+    """G: open dialog to jump to an absolute frame number."""
+    if not ann.media_files:
+        return
+    cur_abs = ann._current_abs_idx()
+    dpg.set_value("goto_frame_input", cur_abs)
+    dpg.configure_item("goto_frame_modal", show=True)
+    dpg.focus_item("goto_frame_input")
+
+
+def _cb_goto_frame_apply(sender=None, app_data=None):
+    """Jump to the absolute frame entered in the goto dialog."""
+    target = dpg.get_value("goto_frame_input")
+    _hide_modal("goto_frame_modal")
+    dpg.focus_item("primary_window")
+    if target < 0 or target >= _max_frame:
+        _show_progress(f"Frame {target} out of range (0-{_max_frame - 1}).", 0)
+        return
+    target_block = target // ann.block_size
+    target_local = target % ann.block_size
+    if target_block != ann.current_block:
+        ann.set_current_block(target_block)
+        _reload_block()
+    if 0 <= target_local < len(ann.media_files):
+        ann.set_img(target_local)
+        load_and_show_frame()
 
 
 def cb_prev_frame():
@@ -1199,12 +1240,16 @@ def _do_load_media(file_path, block_size):
         else:
             media_basename = folder_name or os.path.splitext(os.path.basename(file_path))[0]
     if media_basename:
+        global _pending_session_name
         ann.set_session_name(media_basename)
         if _dpg_ready:
-            try:
-                dpg.set_value("session_name_input", media_basename)
-            except Exception:
-                pass
+            if threading.get_ident() != _main_thread_id:
+                _pending_session_name = media_basename
+            else:
+                try:
+                    dpg.set_value("session_name_input", media_basename)
+                except Exception:
+                    pass
 
     # get total frames
     if is_video:
@@ -1480,13 +1525,26 @@ def _reconcile_session_group_ids():
                 f"Checking JSONs... {i+1}/{total_jsons}",
                 int((i + 1) / total_jsons * 100))
 
-    # 为 group_id=None 的 name 分配 gid（如果该 name 已有 gid 则复用，否则新分配）
-    next_gid = 1
-    all_existing_gids = set()
+    # 为 group_id=None 的 name 分配 gid
+    # 关键：考虑 pkl 中已有 label 的 gid，避免与"pkl 有但 JSON 没引用"的 label 撞车
+    json_gids_used = set()
     for gids in name_to_gids.values():
-        all_existing_gids.update(gids)
-    if all_existing_gids:
-        next_gid = max(all_existing_gids) + 1
+        json_gids_used.update(gids)
+
+    # pkl 单实例 name → gid 的映射（仅当 gid 不与 JSON 已用 gid 冲突时记录）
+    pkl_name_count = defaultdict(int)
+    for label in ann.sam_handler.labels:
+        pkl_name_count[label.name] += 1
+    pkl_unique_gid = {}
+    for label in ann.sam_handler.labels:
+        if pkl_name_count[label.name] == 1 and label.group_id not in json_gids_used:
+            pkl_unique_gid[label.name] = label.group_id
+
+    # 全部已用 gid = JSON 中的 + pkl 中的，next_gid 从最大值后跳
+    all_existing_gids = set(json_gids_used)
+    for label in ann.sam_handler.labels:
+        all_existing_gids.add(label.group_id)
+    next_gid = max(all_existing_gids) + 1 if all_existing_gids else 1
 
     none_gid_assigned = {}  # name → newly assigned gid
     for name in names_with_none_gid:
@@ -1494,10 +1552,16 @@ def _reconcile_session_group_ids():
             # 该 name 已有 gid，取最小的
             none_gid_assigned[name] = min(name_to_gids[name])
         elif name not in name_to_gids:
-            # 该 name 只出现过 group_id=None，分配新 gid
-            none_gid_assigned[name] = next_gid
-            name_to_gids[name].add(next_gid)
-            next_gid += 1
+            # 该 name 只出现过 group_id=None
+            if name in pkl_unique_gid:
+                # 优先复用 pkl 同名 label 的 gid（避免后续 remap 和潜在的额外帧 mask 错位）
+                gid = pkl_unique_gid[name]
+            else:
+                # 没有可复用的 → 分配新 gid（已跳过所有 pkl 占用的 gid）
+                gid = next_gid
+                next_gid += 1
+            none_gid_assigned[name] = gid
+            name_to_gids[name].add(gid)
 
     # 回写 JSON：把 group_id=None 修正为正确的数字
     if none_gid_assigned:
@@ -1577,8 +1641,14 @@ def _reconcile_session_group_ids():
             if label.group_id in remap:
                 label.group_id = remap[label.group_id]
 
-        for d in [ann.masks, ann.tracking_results]:
+        # ann.masks / ann.tracking_results: {abs_idx: {gid: data}}
+        # ann.extra_frame / ann.extra_frame_masks: {block: {gid: data}}
+        # 内层 dict 都是 gid → data，结构一致，统一处理
+        for d in [ann.masks, ann.tracking_results,
+                  ann.extra_frame, ann.extra_frame_masks]:
             for frame_data in d.values():
+                if not isinstance(frame_data, dict):
+                    continue
                 for old_gid, tmp_gid in tmp_remap.items():
                     if old_gid in frame_data:
                         frame_data[tmp_gid] = frame_data.pop(old_gid)
@@ -1615,9 +1685,20 @@ def _reconcile_session_group_ids():
             ann.set_current_block(target_block)
             ann.curr_img_idx = frame_in_block
 
-    # 保存修正后的 pkl
+    # 保存修正后的 pkl（先备份现有 pkl 到带时间戳的 .bak，保留历史）
     session_name = ann.session_name or "session"
     pkl_path = os.path.join(ann.project_dir, f"{session_name}.pkl")
+    bak_name = None
+    if os.path.exists(pkl_path):
+        import shutil as _shutil
+        from datetime import datetime as _dt
+        bak_name = f"{session_name}.pkl.bak.{_dt.now().strftime('%Y%m%d-%H%M%S')}"
+        bak_path = os.path.join(ann.project_dir, bak_name)
+        try:
+            _shutil.copy2(pkl_path, bak_path)
+        except Exception as e:
+            print(f"[reconcile] backup failed: {e}")
+            bak_name = None
     data = ann.compress_to_dict()
     with open(pkl_path, "wb") as f:
         pickle.dump(data, f)
@@ -1627,7 +1708,8 @@ def _reconcile_session_group_ids():
         parts.append(f"remapped {len(remap)} group_id(s)")
     if added:
         parts.append(f"added {len(added)} label(s): {', '.join(added)}")
-    _show_progress(f"Reconcile done: {'; '.join(parts)}. Session saved.", 100)
+    suffix = f" (backup: {bak_name})" if bak_name else ""
+    _show_progress(f"Reconcile done: {'; '.join(parts)}. Session saved{suffix}.", 100)
 
 
 def _load_session_from_path(path):
@@ -1646,6 +1728,10 @@ def _load_session_from_path(path):
         ann.read_frames = -1
         block_size = ann.block_size
         start_frame = ann.current_block * block_size
+
+        # Always reset media_path to frames_dir so that block switching
+        # works even when the session was saved on a different machine.
+        ann.media_path = os.path.abspath(ann.frames_dir)
 
         # check if frames exist on disk (same logic as source project)
         frames_dir = ann.frames_dir
@@ -2021,8 +2107,16 @@ def cb_reassign_label(sender, app_data):
         _show_progress("Start frame must be <= end frame.", 0)
         return
     # find group_ids from display names like "0: 抓钳"
-    src_idx = int(src_name.split(":")[0])
-    dst_idx = int(dst_name.split(":")[0])
+    try:
+        src_idx = int(src_name.split(":")[0])
+        dst_idx = int(dst_name.split(":")[0])
+    except (ValueError, IndexError):
+        _show_progress("Invalid label selection. Please re-select.", 0)
+        return
+    if src_idx < 0 or src_idx >= len(ann.sam_handler.labels) or \
+       dst_idx < 0 or dst_idx >= len(ann.sam_handler.labels):
+        _show_progress("Label index out of range. Please re-select.", 0)
+        return
     src_gid = ann.sam_handler.labels[src_idx].group_id
     dst_gid = ann.sam_handler.labels[dst_idx].group_id
 
@@ -2039,6 +2133,9 @@ def _refresh_reassign_combos():
     items = [f"{i}: {l.name}" for i, l in enumerate(ann.sam_handler.labels)]
     dpg.configure_item("reassign_src", items=items)
     dpg.configure_item("reassign_dst", items=items)
+    # Reset selected values to avoid stale references after label changes
+    dpg.set_value("reassign_src", items[0] if items else "")
+    dpg.set_value("reassign_dst", items[1] if len(items) > 1 else "")
 
 
 # ── delete label in range ────────────────────────────────────────────────────
@@ -2057,7 +2154,14 @@ def cb_delete_label_in_range(sender, app_data):
     if start_abs > end_abs:
         _show_progress("Start frame must be <= end frame.", 0)
         return
-    label_idx = int(label_name.split(":")[0])
+    try:
+        label_idx = int(label_name.split(":")[0])
+    except (ValueError, IndexError):
+        _show_progress("Invalid label selection. Please re-select.", 0)
+        return
+    if label_idx < 0 or label_idx >= len(ann.sam_handler.labels):
+        _show_progress("Label index out of range. Please re-select.", 0)
+        return
     gid = ann.sam_handler.labels[label_idx].group_id
     n = ann.delete_label_in_range(gid, start_abs, end_abs)
     _show_progress(f"Deleted {n} frames of '{ann.sam_handler.labels[label_idx].name}' in [{start_abs}-{end_abs}]", 100)
@@ -2077,6 +2181,7 @@ def _refresh_delete_range_combo():
         return
     items = [f"{i}: {l.name}" for i, l in enumerate(ann.sam_handler.labels)]
     dpg.configure_item("delete_range_label", items=items)
+    dpg.set_value("delete_range_label", items[0] if items else "")
 
 
 # ── modal dialogs ────────────────────────────────────────────────────────────
@@ -2200,6 +2305,16 @@ def _build_modal_dialogs():
         with dpg.group(horizontal=True):
             dpg.add_button(label="OK", callback=_cb_preextract_path_apply, width=100)
             dpg.add_button(label="Cancel", callback=lambda: _hide_modal("preextract_modal"), width=100)
+
+    # Go-to-frame dialog
+    with dpg.window(label="Go to Frame", tag="goto_frame_modal",
+                    modal=True, show=False, width=300, height=90, no_resize=True):
+        dpg.add_input_int(tag="goto_frame_input", default_value=0, width=-1,
+                          min_value=0, min_clamped=True,
+                          on_enter=True, callback=_cb_goto_frame_apply)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Go", callback=_cb_goto_frame_apply, width=100)
+            dpg.add_button(label="Cancel", callback=lambda: (_hide_modal("goto_frame_modal"), dpg.focus_item("primary_window")), width=100)
 
     # Reassign label dialog
     with dpg.window(label="Reassign Label", tag="reassign_modal",
@@ -2454,6 +2569,23 @@ def build_ui():
 
     while dpg.is_dearpygui_running():
         global _session_load_done, _media_load_done
+        global _pending_progress, _pending_session_name
+        # flush thread-safe UI updates
+        pp = _pending_progress
+        if pp is not None:
+            _pending_progress = None
+            try:
+                dpg.set_value("progress_bar", pp[1] / 100.0)
+                dpg.set_value("progress_text", pp[0])
+            except Exception:
+                pass
+        psn = _pending_session_name
+        if psn is not None:
+            _pending_session_name = None
+            try:
+                dpg.set_value("session_name_input", psn)
+            except Exception:
+                pass
         if _media_load_done:
             _media_load_done = False
             refresh_label_listbox()

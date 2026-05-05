@@ -16,7 +16,7 @@ pycocotools>=2.0.6
 iopath>=0.1.10
 
 # GUI
-dearpygui>=2.0
+dearpygui==2.2
 
 # misc
 hydra-core

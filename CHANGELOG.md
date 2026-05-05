@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.5.2] - 2026-05-05
+### Added
+- **Go to Frame** 跳帧功能：按 `G` 键弹窗输入绝对帧号，自动切换到对应 block 和帧（输入框 Enter 直接确认）
+- Reconcile Labels 写 pkl 前自动备份原 pkl 到 `{session}.pkl.bak.YYYYMMDD-HHMMSS`，保留多份历史，覆写崩溃可手动恢复；完成消息显示具体备份文件名
+
+### Fixed
+- 修复后台线程直接调用 DPG 引发的偶发崩溃：`_show_progress` 和 session_name_input 写入引入主线程延迟刷新机制（`_pending_progress` / `_pending_session_name` 在 build_ui 主循环 flush）
+- 修复加载其他机器保存的 session 后切换 block 失效的问题：`_load_session_from_path` 总是把 `media_path` 重置为本地 `frames_dir` 的绝对路径
+- 修复 Reassign Label / Delete Label in Range 弹窗在 label 列表变化后选项显示陈旧值导致索引越界崩溃：解析索引加 try/except + 范围校验，刷新 combo 后主动重置 selected 值到首项
+- **Reconcile Labels** 给 `group_id=None` 分配新 gid 时考虑 pkl 中已有 gid，避免与"pkl 创建过但 JSON 没引用"的 label 撞车；优先复用 pkl 同名 label 的 gid，消除 set 迭代顺序带来的非确定性，并大幅减少不必要的 remap
+- **Reconcile Labels** remap 时同步迁移 `extra_frame` / `extra_frame_masks`（之前只迁 `masks` / `tracking_results`），修复 remap 触发后 block 末尾额外帧 mask 与 label 错位的问题
+- 修复 `reassign_label_in_range` 返回值只统计 JSON 改动数的问题：现在按"实际被修改的帧"去重计数（包含仅内存 mask 迁移而 JSON 未变的帧）
+
+### Changed
+- `_is_input_focused` 把 `goto_frame_input` 加入白名单，避免 goto 弹窗内 Shift+1/2/3/4 误触发 view mode 切换、A/D 误切帧等冲突
+- `requirements.txt`：dearpygui 从 `>=2.0` 锁定到 `==2.2`，避免不同次版本间 API 差异导致的偶发兼容问题
+
 ## [1.5.1] - 2026-05-01
 ### Changed
 - 导出验证视频和 overlay 图片时，label 名称直接标注在对应 mask 区域上方（使用 label 自身颜色 + 白色描边），取代之前左上角的小图例，更直观清晰
