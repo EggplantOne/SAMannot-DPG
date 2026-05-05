@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.5.3] - 2026-05-05
+### Fixed
+- 修复按 `C` 键清空当前帧标注后画面不立即刷新的问题：原本只调 `draw_overlays()` 重画提示点/框那一层，未重新渲染底图纹理；overlay/masks 视图下 `create_combined_mask` 又优先从 `self.masks[abs_idx]` 内存读，导致即使 JSON 已删，画面仍显示旧 mask，要切到相邻帧再切回才消失。现在同时清掉 `self.masks` / `self.overlay_imgs` / `self.combined_masks` 中该帧的条目，并改调 `load_and_show_frame()` 立即刷新底图
+
 ## [1.5.2] - 2026-05-05
 ### Added
 - **Go to Frame** 跳帧功能：按 `G` 键弹窗输入绝对帧号，自动切换到对应 block 和帧（输入框 Enter 直接确认）

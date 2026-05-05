@@ -1141,13 +1141,18 @@ def cb_clear_prompts():
     json_path = os.path.join(ann.project_dir, "jsons", f"{abs_idx:06d}.json")
     if os.path.exists(json_path):
         os.remove(json_path)
+    # drop in-memory masks for this frame so overlay/masks views refresh immediately
+    if abs_idx in ann.masks:
+        del ann.masks[abs_idx]
+    if abs_idx in ann.overlay_imgs:
+        del ann.overlay_imgs[abs_idx]
+    if abs_idx in ann.combined_masks:
+        del ann.combined_masks[abs_idx]
     # also clear prop_frames for this frame
     for label in ann.sam_handler.labels:
         pf = label.prop_frames.get(block, set())
         pf.discard(frame_idx)
-    draw_overlays()
-    update_prompt_list()
-    _draw_timeline()
+    load_and_show_frame()
 
 
 def cb_undo_last_prompt():
