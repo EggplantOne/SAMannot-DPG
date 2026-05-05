@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.5.4] - 2026-05-05
+### Added
+- Label 列表每行名字前显示 mask 颜色的小色块,UI 与画面 overlay 颜色对应,扫一眼就能知道哪个 label 是哪个色：将原 `add_listbox` 替换为 `child_window` 内逐行 `add_text("■", color=label.col) + add_selectable`,选中态由 selectable 自带高亮维护,W/S 切换、Library 增删等所有调 `refresh_label_listbox()` 的入口自动同步
+
+### Fixed
+- **Reconcile Labels**: 新增 pkl 内部 `group_id` 去重(step 1.5)。多个不同 name 的 pkl label 撞同一个 gid 时,按 gid 查 label 的 first-match-wins 路径(`get_label_idx_by_group_id`、`create_combined_mask`、`get_mask_color` 等)会把多个 label 的 mask 全染成第一个 label 的颜色,reassign 也会找错 src_label 导致 prompts 不被搬运。现在优先保留 name 与 JSON 该 gid 对应的 label,其余自动分配新 gid;reconcile 末尾保存 pkl 落盘
+- **切换项目 label 没清空**: `_do_load_media` 开头补 `ann.reset()`,清掉上一个项目残留的 `sam_handler.labels`、`masks`、`tracking_results`、`propagation_blocks` 等状态。之前 Load Folder 选了没有 pkl 的新目录时只走 `_do_load_media`,完全不动 labels,旧 label 列表会一直残留在 UI 里(Load Session 走 `load_from_dict` 自带状态替换,不受影响)
+- 字体加载补充 `add_font_range(0x2500, 0x25FF)`(Box Drawing + Geometric Shapes 块,包含 ■ U+25A0)。`mvFontRangeHint_Chinese_Full` 默认不覆盖几何符号块,导致色块字符显示为 tofu/问号
+
+### Changed
+- **Reassign Label / Delete Label in Range 完成后自动保存 pkl**: 这两个 op 在过程中已经把 JSON 修改写入磁盘,如果 pkl 不一起落盘,中途崩溃或忘 Ctrl+S 退出会导致 JSON 是新的、pkl 是旧的"半保存"脏状态(下次打开 prompts 与 JSON 对不上)。新增 `_autosave_pkl()` 静默保存,失败时打印警告但不抛异常;进度条后缀显示 `(pkl saved)` / `(pkl save failed)`。原则:碰 JSON 的 op 自动同步 pkl,只动内存的小操作(单点 prompt、`-` 删 label、改名)仍由用户手动 Save
+
 ## [1.5.3] - 2026-05-05
 ### Fixed
 - 修复按 `C` 键清空当前帧标注后画面不立即刷新的问题：原本只调 `draw_overlays()` 重画提示点/框那一层，未重新渲染底图纹理；overlay/masks 视图下 `create_combined_mask` 又优先从 `self.masks[abs_idx]` 内存读，导致即使 JSON 已删，画面仍显示旧 mask，要切到相邻帧再切回才消失。现在同时清掉 `self.masks` / `self.overlay_imgs` / `self.combined_masks` 中该帧的条目，并改调 `load_and_show_frame()` 立即刷新底图

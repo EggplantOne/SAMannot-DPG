@@ -355,12 +355,24 @@ def save_label_presets(presets):
 
 
 def refresh_label_listbox():
-    items = []
+    if not dpg.does_item_exist("label_list_container"):
+        return
+    dpg.delete_item("label_list_container", children_only=True)
     for i, label in enumerate(ann.sam_handler.labels):
-        items.append(f"{i}: {label.name}")
-    dpg.configure_item("label_listbox", items=items)
-    if 0 <= ann.curr_label_idx < len(items):
-        dpg.set_value("label_listbox", items[ann.curr_label_idx])
+        hex_col = label.col or "#C8C8C8"
+        try:
+            r = int(hex_col[1:3], 16)
+            g = int(hex_col[3:5], 16)
+            b = int(hex_col[5:7], 16)
+        except (ValueError, IndexError):
+            r, g, b = 200, 200, 200
+        with dpg.group(horizontal=True, parent="label_list_container"):
+            dpg.add_text("■", color=(r, g, b, 255))
+            dpg.add_selectable(label=f"{i}: {label.name}",
+                               tag=f"label_sel_{i}",
+                               user_data=i,
+                               callback=cb_label_listbox,
+                               default_value=(i == ann.curr_label_idx))
     _refresh_reassign_combos()
 
 
@@ -382,17 +394,20 @@ def update_prompt_list():
     dpg.configure_item("prompt_listbox", items=items)
 
 
-def cb_label_listbox(sender, app_data):
-    if not app_data:
+def cb_label_listbox(sender, app_data, user_data):
+    idx = user_data
+    if idx is None or idx < 0 or idx >= len(ann.sam_handler.labels):
+        if dpg.does_item_exist(sender):
+            dpg.set_value(sender, False)
         return
-    try:
-        idx = int(app_data.split(":")[0])
-        ann.set_current_label(idx)
-        update_status_bar()
-        update_prompt_list()
-        draw_overlays()
-    except (ValueError, IndexError):
-        pass
+    for j in range(len(ann.sam_handler.labels)):
+        tag = f"label_sel_{j}"
+        if dpg.does_item_exist(tag):
+            dpg.set_value(tag, j == idx)
+    ann.set_current_label(idx)
+    update_status_bar()
+    update_prompt_list()
+    draw_overlays()
 
 
 def cb_add_label(sender, app_data):
@@ -1220,6 +1235,10 @@ class _ProgressVar:
 
 def _do_load_media(file_path, block_size):
     global _loaded_file_path, _max_frame
+    # 切到新项目（没有 pkl 的路径）：先清空上一个项目残留的 labels / masks /
+    # tracking_results 等状态，否则旧 label 会留在 UI 里。session pkl 加载走
+    # _load_session_from_path → load_from_dict，自带状态替换，不需要这一步。
+    ann.reset()
     _loaded_file_path = file_path
     ann.block_size = block_size
 
@@ -1483,6 +1502,23 @@ def cb_save_session(sender, app_data):
     _show_progress(f"Saved: {path}", 100)
 
 
+def _autosave_pkl():
+    """Silent pkl save used after operations that already wrote to JSON on disk
+    (reassign, delete-in-range), to keep pkl in sync. Returns True on success."""
+    if not ann.media_files:
+        return False
+    try:
+        os.makedirs(ann.project_dir, exist_ok=True)
+        session_name = ann.session_name or "session"
+        pkl_path = os.path.join(ann.project_dir, f"{session_name}.pkl")
+        with open(pkl_path, "wb") as f:
+            pickle.dump(ann.compress_to_dict(), f)
+        return True
+    except Exception as e:
+        print(f"[autosave] failed: {e}")
+        return False
+
+
 def _reconcile_session_group_ids():
     """Load Session 后：扫描 JSON 文件，确保 pkl 的 group_id 和 JSON 一致。
     如果不一致，pkl 适配 JSON（JSON 是落盘数据，pkl 迁就它）。"""
@@ -1529,6 +1565,50 @@ def _reconcile_session_group_ids():
             _show_progress(
                 f"Checking JSONs... {i+1}/{total_jsons}",
                 int((i + 1) / total_jsons * 100))
+
+    # Step 1.5: pkl 内部 group_id 去重
+    # 不同 name 的 pkl label 撞同一 gid 时，按 gid 查 label 的 "first match wins" 路径
+    # （annotator.py:313, 1428, 1448）会把多个 label 的 mask 全染成第一个 label 的颜色。
+    # 优先保留 name 与 JSON 该 gid 对应的 label；其余分配新 gid。
+    gid_to_pkl_labels = defaultdict(list)
+    for label in ann.sam_handler.labels:
+        gid_to_pkl_labels[label.group_id].append(label)
+    pkl_dups = {gid: lbls for gid, lbls in gid_to_pkl_labels.items() if len(lbls) > 1}
+
+    dedup_moves = []  # [(name, old_gid, new_gid)]
+    if pkl_dups:
+        all_used_gids = set()
+        for gids in name_to_gids.values():
+            all_used_gids.update(gids)
+        for label in ann.sam_handler.labels:
+            all_used_gids.add(label.group_id)
+        fresh_gid = max(all_used_gids) + 1 if all_used_gids else 1
+
+        for gid, dup_labels in pkl_dups.items():
+            keeper = None
+            for lbl in dup_labels:
+                if lbl.name in name_to_gids and gid in name_to_gids[lbl.name]:
+                    keeper = lbl
+                    break
+            if keeper is None:
+                keeper = dup_labels[0]
+            for lbl in dup_labels:
+                if lbl is keeper:
+                    continue
+                old = lbl.group_id
+                lbl.group_id = fresh_gid
+                dedup_moves.append((lbl.name, old, fresh_gid))
+                fresh_gid += 1
+
+        if dedup_moves:
+            # 撞 gid 时 mask 数据归属本就是模糊的（写入会互相覆盖），保留在 keeper 名下；
+            # 被腾出的 label 从空 mask 重新开始。
+            ann.label_handler._next_group_id = max(
+                ann.label_handler._next_group_id, fresh_gid)
+            _show_progress(
+                "Dedup pkl group_ids: " + ", ".join(
+                    f"'{n}' #{o}->#{nn}" for n, o, nn in dedup_moves),
+                0)
 
     # 为 group_id=None 的 name 分配 gid
     # 关键：考虑 pkl 中已有 label 的 gid，避免与"pkl 有但 JSON 没引用"的 label 撞车
@@ -1631,7 +1711,7 @@ def _reconcile_session_group_ids():
     if errors:
         _show_progress("group_id mismatch: " + "; ".join(errors), 0)
 
-    if not remap and not missing:
+    if not remap and not missing and not dedup_moves:
         if not errors:
             _show_progress("Reconcile: group_ids already consistent.", 100)
         return
@@ -1709,6 +1789,8 @@ def _reconcile_session_group_ids():
         pickle.dump(data, f)
 
     parts = []
+    if dedup_moves:
+        parts.append(f"deduped {len(dedup_moves)} pkl group_id(s)")
     if remap:
         parts.append(f"remapped {len(remap)} group_id(s)")
     if added:
@@ -2126,7 +2208,9 @@ def cb_reassign_label(sender, app_data):
     dst_gid = ann.sam_handler.labels[dst_idx].group_id
 
     n = ann.reassign_label_in_range(src_gid, dst_gid, start_abs, end_abs)
-    _show_progress(f"Reassigned {n} frames: {ann.sam_handler.labels[src_idx].name} -> {ann.sam_handler.labels[dst_idx].name} [{start_abs}-{end_abs}]", 100)
+    saved = _autosave_pkl()
+    suffix = " (pkl saved)" if saved else " (pkl save failed)"
+    _show_progress(f"Reassigned {n} frames: {ann.sam_handler.labels[src_idx].name} -> {ann.sam_handler.labels[dst_idx].name} [{start_abs}-{end_abs}]{suffix}", 100)
     load_and_show_frame()
     _draw_timeline()
 
@@ -2169,7 +2253,9 @@ def cb_delete_label_in_range(sender, app_data):
         return
     gid = ann.sam_handler.labels[label_idx].group_id
     n = ann.delete_label_in_range(gid, start_abs, end_abs)
-    _show_progress(f"Deleted {n} frames of '{ann.sam_handler.labels[label_idx].name}' in [{start_abs}-{end_abs}]", 100)
+    saved = _autosave_pkl()
+    suffix = " (pkl saved)" if saved else " (pkl save failed)"
+    _show_progress(f"Deleted {n} frames of '{ann.sam_handler.labels[label_idx].name}' in [{start_abs}-{end_abs}]{suffix}", 100)
     load_and_show_frame()
     _draw_timeline()
 
@@ -2422,6 +2508,7 @@ def _setup_font():
             with dpg.font(font_path, 18) as default_font:
                 dpg.add_font_range_hint(dpg.mvFontRangeHint_Chinese_Full)
                 dpg.add_font_range_hint(dpg.mvFontRangeHint_Default)
+                dpg.add_font_range(0x2500, 0x25FF)  # box drawing + geometric shapes (incl. ■)
             dpg.bind_font(default_font)
         else:
             # fallback: just use default font at larger size
@@ -2489,8 +2576,8 @@ def build_ui():
                                            width=130, on_enter=True, callback=cb_add_label)
                         dpg.add_button(label="+", callback=cb_add_label, width=28)
                         dpg.add_button(label="-", callback=cb_remove_label, width=28)
-                    dpg.add_listbox(tag="label_listbox", items=[], num_items=5,
-                                    callback=cb_label_listbox, width=-1)
+                    dpg.add_child_window(tag="label_list_container",
+                                         width=-1, height=120, border=True)
                     dpg.add_button(label="Library", callback=cb_label_library, width=-1)
 
                 # ── Prompts ──
