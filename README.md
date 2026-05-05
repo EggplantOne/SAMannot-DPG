@@ -271,7 +271,7 @@ python main.py
 - **鼠标左键** 点击画面 = 前景点（绿色，表示"这里是目标"）
 - **鼠标右键** 点击画面 = 背景点（红色，表示"这里不是目标"）
 - **鼠标右键拖拽** = 画一个矩形框
-- 按 **C** 清空当前帧当前标签的标注
+- 按 **C** 清空当前帧**所有标签**的标注（同时删除该帧导出过的 JSON）
 - 按 **Delete** 删除选中的标注
 
 ### 6. 生成分割 & 传播
@@ -303,13 +303,69 @@ python main.py
 - **File → Save**：保存当前标注状态到 `projects/{视频名}/{视频名}.pkl`
 - **File → Load Session**：加载之前保存的 `.pkl` 文件，继续标注（加载后需要重新点 Load Model）
 - **File → Reset**：清空内存中的标注状态（不删除已导出的 JSON 文件）
-- **Edit → Reassign Label**：在指定帧范围内将标注从一个标签批量转移到另一个标签
+
+> Edit 菜单提供 **Reassign Label** / **Delete Label in Range** / **Reconcile Labels** 三种批量编辑功能，详见下方 [Edit 菜单 — 批量编辑](#edit-菜单--批量编辑)。
 
 ### 9. 导出
 
 - 展开左侧 **Export** 区域
 - **Export Annotations**：导出 LabelMe 格式 JSON + 10 张验证图片
 - **Export Verify Video**：生成叠加标注的验证视频（如果是帧文件夹模式，会弹窗让你选源视频）
+
+---
+
+## Edit 菜单 — 批量编辑
+
+菜单栏 **Edit** 下提供三种跨帧批量操作。每项都同时改写 **磁盘上的 JSON** 和 **内存中的 prompts / masks / prop_frames**，无需重新传播。
+
+> 帧号都是**绝对帧号**（视频原始帧号，时间线上看到的那个），不是 block 内的局部下标。范围都是**闭区间** `[start, end]`。
+
+### Reassign Label — 把一个标签的标注转移到另一个标签
+
+把指定帧范围内属于"源标签"的所有 mask 和 prompts 转移给"目标标签"。
+
+**典型场景：**
+- 标到一半才发现前 200 帧把 "抓钳" 错标成了 "剪刀"，想批量改回去
+- 同名多实例下不小心把一个实例的标注混进了另一个实例
+
+**怎么用：**
+1. Edit → Reassign Label
+2. **Source label**：要从哪个标签搬走（下拉框显示 `序号: 标签名`）
+3. **Target label**：搬到哪个标签
+4. **Frames**：起止绝对帧号
+5. Apply
+
+如果目标标签在某帧已经存在 mask，源 mask 会和目标 mask **按位或合并**（不会覆盖丢失）。
+
+### Delete Label in Range — 在帧范围内删除某个标签的标注
+
+把指定帧范围内属于该标签的所有 mask 和 prompts 全部删掉。
+
+**典型场景：**
+- 某个标签在 500-800 帧之间传播错了，想整段删掉重新打
+- 物体已经离开画面但 mask 还在拖尾
+
+**怎么用：**
+1. Edit → Delete Label in Range
+2. **Label to delete**：要清掉的标签
+3. **Frames**：起止绝对帧号
+4. Apply
+
+如果某帧 JSON 中删完后再没有任何 shape，整个 JSON 文件会被自动删除（时间线上的蓝色标记会消失）。
+
+### Reconcile Labels — 修复 group_id 不一致
+
+扫描所有 JSON，把 JSON 里的 `group_id` 与 pkl 里的标签对齐，修复以下情况：
+- 加载 session 后 mask 显示成白色（pkl 和 JSON 的 group_id 对不上）
+- 旧版 JSON 没有 `group_id` 字段（自动按 label 名分配）
+- 多实例标签被错误合并
+
+**怎么用：**
+1. Edit → Reconcile Labels
+2. **Block Size**：可以改 block size（用旧 block size 标注后想换粒度时用得上）
+3. Run Reconcile
+
+> ⚠️ **重要：** 跑之前先手动删掉**明显标错的 JSON**（例如选错文件夹后误标的整段 block）。否则工具无法区分"错误标注"和"同名多实例"，会把它们当成合法实例保留。
 
 ---
 
@@ -320,7 +376,8 @@ python main.py
 | `A` / `D` | 上一帧 / 下一帧 |
 | `W` / `S` | 上一个标签 / 下一个标签 |
 | `Q` / `E` | 跳到上/下一个有标注的帧 |
-| `C` | 清空当前帧所有标签的标注 |
+| `G` | 弹窗输入绝对帧号跳转（跨 block 也可以，会自动切到对应 block） |
+| `C` | 清空当前帧所有标签的标注（同时删除该帧 JSON） |
 | `Z` | 撤回当前标签在当前帧的最后一个标注点 |
 | `Delete` | 删除选中的标注 |
 | `Shift+1/2/3/4` | 切换视图模式（Original/Prompt/Overlay/Mask） |
