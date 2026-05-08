@@ -932,6 +932,8 @@ _selected_model_name = "Large"
 def _load_model_by_name(name):
     """Set model name and trigger load."""
     global _selected_model_name
+    if not name or name not in MODEL_OPTIONS:
+        return
     _selected_model_name = name
     cb_load_model(None, None)
 
@@ -2560,7 +2562,7 @@ def build_ui():
             dpg.add_menu_item(label=">>", callback=cb_block_next)
             with dpg.menu(label="Load Model"):
                 for name in MODEL_OPTIONS.keys():
-                    dpg.add_menu_item(label=name, callback=lambda s, a, n=name: _load_model_by_name(n))
+                    dpg.add_menu_item(label=name, callback=lambda s, a, u=None, n=name: _load_model_by_name(n))
             dpg.add_text("  No media loaded", tag="info_text", color=(200, 220, 255))
 
         _build_modal_dialogs()
