@@ -133,6 +133,8 @@ conda activate samannot
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/xpu
 ```
 
+> XPU stability note: SAM2 inference on Intel XPU should run in float32. This project disables autocast on XPU because BF16 autocast can make SAM2 mask logits drift positive and produce masks that cover most of the frame. CUDA still uses autocast.
+
 > **为什么用 `xpu` 而不是 `cu128`？** Intel GPU 不支持 CUDA（那是 NVIDIA 专属），而是用 Intel 自己的 XPU 后端。PyTorch 2.5+ 已原生支持 Intel XPU，不需要额外装插件。
 >
 > pip 会自动选择跟你 Python 版本兼容的最新 PyTorch 版本。如果最新版有问题，可以指定版本：
@@ -144,6 +146,12 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 ```bash
 python -c "import torch; print(torch.__version__, hasattr(torch, 'xpu') and torch.xpu.is_available())"
+```
+
+You should see a `+xpu` PyTorch build and `True`, for example:
+
+```text
+2.11.0+xpu True
 ```
 
 应输出 `2.x.x+xpu True`。如果输出 `False`：
@@ -479,6 +487,11 @@ projects/
 - Block Size 设 **100-150**
 - 用 **Checkpoint** 控制传播范围（不用把 Block Size 调小也能减少单次传播帧数）
 - 推理时关闭浏览器等占内存的程序
+
+**Intel XPU performance note:**
+- First inference can be slower because PyTorch XPU initializes and compiles kernels.
+- After warm-up on Intel Arc 130T with Tiny, this project measured about 2.0x faster single-frame prediction and about 3.3x faster 6-frame propagation compared with CPU.
+- If masks cover most of the frame only on XPU, ensure this version is used so XPU autocast is disabled.
 
 ---
 
