@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+### Fixed
+- Fixed SAM2 mask over-expansion on Intel XPU by disabling autocast for XPU inference paths. XPU now runs SAM2 in float32 while CUDA keeps AMP enabled, avoiding the positive-logit drift that made masks cover most of the frame.
+- Fixed `Load Model` menu callbacks by passing the model name through DearPyGui `user_data` instead of relying on a lambda closure.
+- Moved inference busy/progress UI updates back onto the DearPyGui main thread to avoid missing progress updates and native UI crashes from worker-thread DPG calls.
+
+### Changed
+- Added concise terminal logs for SAM2 model loading, checkpoint selection, and load failures.
+
+### Verified
+- On Intel Arc 130T with `torch 2.11.0+xpu`, Tiny single-frame mask area matched CPU output on a real annotated frame: `0.0201` mask ratio after the fix versus `0.5503` before the fix.
+- Warmed-up Tiny inference on the same project was faster on XPU than CPU: single-frame prediction about 2.0x faster and 6-frame propagation about 3.3x faster.
+
 ## [1.5.4] - 2026-05-05
 ### Added
 - Label 列表每行名字前显示 mask 颜色的小色块,UI 与画面 overlay 颜色对应,扫一眼就能知道哪个 label 是哪个色：将原 `add_listbox` 替换为 `child_window` 内逐行 `add_text("■", color=label.col) + add_selectable`,选中态由 selectable 自带高亮维护,W/S 切换、Library 增删等所有调 `refresh_label_listbox()` 的入口自动同步

@@ -3,6 +3,7 @@ import torch
 import time
 import numpy as np
 import os
+from contextlib import nullcontext
 from label import Label
 from sam2.build_sam import build_sam2_video_predictor
 from sam2.sam2_image_predictor import SAM2ImagePredictor
@@ -36,7 +37,7 @@ class SAM_Annotator:
                 torch.backends.cudnn.allow_tf32 = True
         elif hasattr(torch, 'xpu') and torch.xpu.is_available():
             self.device = torch.device('xpu')
-            self.autocast_dtype = torch.bfloat16  # XPU has poor float16 precision
+            self.autocast_dtype = torch.float32
             print(f'Using Intel XPU: {torch.xpu.get_device_name(0)}')
         else:
             self.device = torch.device('cpu')
@@ -47,6 +48,10 @@ class SAM_Annotator:
         self.tracking_init = False
         self.object_ids = {}
         self.frame_names = None
+    def _autocast_context(self):
+        if self.device.type == "cuda":
+            return torch.autocast(device_type="cuda", dtype=self.autocast_dtype)
+        return nullcontext()
     def load_model(self, status_callback):
         if self.model_loaded or self.model_loading:
             return True
@@ -161,7 +166,7 @@ class SAM_Annotator:
                 return {}
             image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-            with torch.autocast(self.device.type, dtype=self.autocast_dtype):
+            with self._autocast_context():
                 self.image_predictor.set_image(image_rgb)
                 results = {}
                 frame_results = {}
@@ -193,7 +198,7 @@ class SAM_Annotator:
             return {}
         try:
             self.predictor.reset_state(self.inference_state)
-            with torch.autocast(self.device.type, dtype=self.autocast_dtype):
+            with self._autocast_context():
                 if direction == -1:
                     # backward: only use prompts from the nearest prompt frame (<= start_frame_idx)
                     prompt_frame = self._find_nearest_prompt_frame(start_frame_idx)
@@ -294,7 +299,7 @@ class SAM_Annotator:
                     total_prop_frames = start_frame_idx - end_frame_idx
                 else:
                     total_prop_frames = start_frame_idx
-            with torch.autocast(self.device.type, dtype=self.autocast_dtype):
+            with self._autocast_context():
                 for i, (out_frame_idx, out_obj_ids, out_mask_logits) in enumerate(
                         self.predictor.propagate_in_video(self.inference_state,start_frame_idx=start_frame_idx,max_frame_num_to_track=total_prop_frames,reverse=(direction != 1))):
                     masks = (out_mask_logits > 0.0).cpu().numpy()
@@ -351,7 +356,7 @@ class SAM_Annotator:
                 obj_id = self._get_object_id(group_id)
                 label_name = gid_to_name[group_id]
                 # Add prompts — single call per frame to avoid clear_old_points overwrite
-                with torch.autocast(self.device.type, dtype=self.autocast_dtype):
+                with self._autocast_context():
                     for frame_idx in sorted(frames_data.keys()):
                         data = frames_data[frame_idx]
                         pts = np.array(data["pts"]) if data["pts"] else None
@@ -367,7 +372,7 @@ class SAM_Annotator:
                 min_frame = min(frames_data.keys())
                 this_masks = {}
                 this_scores = {}
-                with torch.autocast(self.device.type, dtype=self.autocast_dtype):
+                with self._autocast_context():
                     for i, (out_frame_idx, _, out_mask_logits) in enumerate(
                             self.predictor.propagate_in_video(self.inference_state, start_frame_idx=min_frame, max_frame_num_to_track=total_frames - min_frame, reverse=False)):
                         logit = out_mask_logits[0]
@@ -377,7 +382,7 @@ class SAM_Annotator:
                             progress = ((li * 2 * total_frames + i) / (num_labels * 2 * total_frames)) * 100
                             progress_callback(f"Propagating {label_name} (forward)...", progress)
                 if min_frame > 0:
-                    with torch.autocast(self.device.type, dtype=self.autocast_dtype):
+                    with self._autocast_context():
                         for i, (out_frame_idx, _, out_mask_logits) in enumerate(
                                 self.predictor.propagate_in_video(self.inference_state, start_frame_idx=min_frame, max_frame_num_to_track=min_frame, reverse=True)):
                             if out_frame_idx not in this_masks:
@@ -462,7 +467,7 @@ class SAM_Annotator:
             # Reset state and add only this label's prompts
             self.predictor.reset_state(self.inference_state)
             obj_id = self._get_object_id(group_id)
-            with torch.autocast(self.device.type, dtype=self.autocast_dtype):
+            with self._autocast_context():
                 for frame_idx in sorted(frames_data.keys()):
                     data = frames_data[frame_idx]
                     pts = np.array(data["pts"]) if data["pts"] else None
@@ -493,7 +498,7 @@ class SAM_Annotator:
             bwd_max_track = start_frame_idx - bwd_end
             # Forward propagation from start_frame_idx
             if do_forward:
-                with torch.autocast(self.device.type, dtype=self.autocast_dtype):
+                with self._autocast_context():
                     for i, (out_frame_idx, _, out_mask_logits) in enumerate(
                             self.predictor.propagate_in_video(
                                 self.inference_state,
@@ -507,7 +512,7 @@ class SAM_Annotator:
                             progress_callback(f"Propagating '{target_label.name}' (forward)...", pct)
             # Backward propagation from start_frame_idx
             if do_backward and start_frame_idx > 0:
-                with torch.autocast(self.device.type, dtype=self.autocast_dtype):
+                with self._autocast_context():
                     for i, (out_frame_idx, _, out_mask_logits) in enumerate(
                             self.predictor.propagate_in_video(
                                 self.inference_state,

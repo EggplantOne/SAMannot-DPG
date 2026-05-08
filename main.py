@@ -49,8 +49,9 @@ _media_load_done = False
 
 # Thread-safe UI update queue (DPG is NOT thread-safe)
 _main_thread_id = threading.get_ident()
-_pending_progress = None          # (msg, pct) or None
+_pending_progress = []            # queued (msg, pct) updates from worker threads
 _pending_session_name = None      # str or None
+_pending_busy_update = False
 
 LABEL_PRESETS_FILE = "label_presets.json"
 
@@ -657,8 +658,11 @@ def _finish_drag():
 # ── SAM2 inference (Step 4) ──────────────────────────────────────────────────
 
 def _set_busy(busy):
-    global inference_busy
+    global inference_busy, _pending_busy_update
     inference_busy = busy
+    if not _dpg_ready or threading.get_ident() != _main_thread_id:
+        _pending_busy_update = True
+        return
     _update_inference_buttons()
     update_status_bar()
 
@@ -675,7 +679,7 @@ def _show_progress(msg, pct=0):
         return
     if threading.get_ident() != _main_thread_id:
         # Off main thread: defer to render loop
-        _pending_progress = (msg, pct)
+        _pending_progress.append((msg, pct))
         return
     try:
         dpg.set_value("progress_bar", pct / 100.0)
@@ -929,12 +933,21 @@ MODEL_OPTIONS = {
 
 _selected_model_name = "Large"
 
+def _cb_load_model_menu(sender, app_data, user_data):
+    """DearPyGui menu callback for loading a named SAM2 model."""
+    _load_model_by_name(user_data)
+
+
 def _load_model_by_name(name):
     """Set model name and trigger load."""
     global _selected_model_name
     if not name or name not in MODEL_OPTIONS:
+        _show_progress(f"Unknown SAM2 model: {name}", 0)
+        print(f"[SAM2] Unknown model selection: {name}", flush=True)
         return
     _selected_model_name = name
+    _show_progress(f"Load requested: SAM2 {name}", 1)
+    print(f"[SAM2] Load requested: {name}", flush=True)
     cb_load_model(None, None)
 
 
@@ -947,16 +960,19 @@ def cb_load_model(sender, app_data):
     # get selected model size
     model_name = _selected_model_name
     cfg, ckpt = MODEL_OPTIONS.get(model_name, MODEL_OPTIONS["Large"])
+    print(f"[SAM2] Preparing {model_name}: cfg={cfg}, ckpt={ckpt}", flush=True)
 
     base = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints")
     ckpt_path = os.path.join(base, ckpt)
     if not os.path.exists(ckpt_path):
         _show_progress(f"Checkpoint not found: {ckpt}. "
                        f"Run: python download_checkpoints.py --only {model_name.lower().rstrip('+')}", 0)
+        print(f"[SAM2] Checkpoint not found: {ckpt_path}", flush=True)
         return
 
     def task():
         import torch, gc
+        print(f"[SAM2] Loading {model_name} from {ckpt_path}", flush=True)
         # unload previous model if loaded
         if ann.model_status():
             _show_progress("Unloading previous model...", 5)
@@ -978,8 +994,10 @@ def cb_load_model(sender, app_data):
         ok = ann.load_model(lambda msg: _show_progress(msg, 50))
         if ok:
             _show_progress(f"SAM2 {model_name} loaded.", 100)
+            print(f"[SAM2] {model_name} loaded", flush=True)
         else:
             _show_progress(f"Failed to load {model_name}.", 0)
+            print(f"[SAM2] Failed to load {model_name}", flush=True)
     _run_inference(task)
 
 
@@ -2521,7 +2539,8 @@ PANEL_W = 250  # left panel width
 
 
 def build_ui():
-    global tex_w, tex_h, tex_data
+    global tex_w, tex_h, tex_data, _main_thread_id
+    _main_thread_id = threading.get_ident()
 
     dpg.create_context()
     dpg.create_viewport(title="SAMannot-DPG", width=1536, height=860)
@@ -2562,7 +2581,7 @@ def build_ui():
             dpg.add_menu_item(label=">>", callback=cb_block_next)
             with dpg.menu(label="Load Model"):
                 for name in MODEL_OPTIONS.keys():
-                    dpg.add_menu_item(label=name, callback=lambda s, a, u=None, n=name: _load_model_by_name(n))
+                    dpg.add_menu_item(label=name, callback=_cb_load_model_menu, user_data=name)
             dpg.add_text("  No media loaded", tag="info_text", color=(200, 220, 255))
 
         _build_modal_dialogs()
@@ -2663,11 +2682,15 @@ def build_ui():
 
     while dpg.is_dearpygui_running():
         global _session_load_done, _media_load_done
-        global _pending_progress, _pending_session_name
+        global _pending_progress, _pending_session_name, _pending_busy_update
         # flush thread-safe UI updates
-        pp = _pending_progress
-        if pp is not None:
-            _pending_progress = None
+        if _pending_busy_update:
+            _pending_busy_update = False
+            _update_inference_buttons()
+            update_status_bar()
+        if _pending_progress:
+            pp = _pending_progress[-1]
+            _pending_progress.clear()
             try:
                 dpg.set_value("progress_bar", pp[1] / 100.0)
                 dpg.set_value("progress_text", pp[0])
