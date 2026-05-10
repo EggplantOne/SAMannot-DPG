@@ -121,17 +121,16 @@ class Annotator:
         self.media_path = dict_representation["media_path"]
         self.video_name = dict_representation["video_name"]
         self.sam_handler.labels = dict_representation["sam_handler_labels"]
-        # migrate old pkl: assign group_id to labels that don't have one
-        if self.sam_handler.labels and not hasattr(self.sam_handler.labels[0], 'group_id'):
-            max_gid = 0
-            for lbl in self.sam_handler.labels:
-                lbl.group_id = max_gid + 1
-                max_gid = lbl.group_id
-            self.label_handler._next_group_id = max_gid + 1
-        else:
-            # update _next_group_id from loaded labels
-            max_gid = max((lbl.group_id for lbl in self.sam_handler.labels), default=0)
-            self.label_handler._next_group_id = max_gid + 1
+        # Minimal old-pkl compatibility. Reconcile Labels is responsible for
+        # resolving None to the JSON-derived group_id or a newly allocated one.
+        for lbl in self.sam_handler.labels:
+            if not hasattr(lbl, 'group_id'):
+                lbl.group_id = None
+        max_gid = max(
+            (lbl.group_id for lbl in self.sam_handler.labels
+             if isinstance(lbl.group_id, int)),
+            default=0)
+        self.label_handler._next_group_id = max_gid + 1
         # rebuild object_id_to_group_id (old pkl had object_id_to_label_name)
         old_mapping = dict_representation.get("sam_handler_object_id_to_label_name",
                        dict_representation.get("sam_handler_object_id_to_group_id", {}))

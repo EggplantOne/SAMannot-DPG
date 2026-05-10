@@ -1592,7 +1592,8 @@ def _reconcile_session_group_ids():
     # 优先保留 name 与 JSON 该 gid 对应的 label；其余分配新 gid。
     gid_to_pkl_labels = defaultdict(list)
     for label in ann.sam_handler.labels:
-        gid_to_pkl_labels[label.group_id].append(label)
+        if isinstance(label.group_id, int):
+            gid_to_pkl_labels[label.group_id].append(label)
     pkl_dups = {gid: lbls for gid, lbls in gid_to_pkl_labels.items() if len(lbls) > 1}
 
     dedup_moves = []  # [(name, old_gid, new_gid)]
@@ -1601,7 +1602,8 @@ def _reconcile_session_group_ids():
         for gids in name_to_gids.values():
             all_used_gids.update(gids)
         for label in ann.sam_handler.labels:
-            all_used_gids.add(label.group_id)
+            if isinstance(label.group_id, int):
+                all_used_gids.add(label.group_id)
         fresh_gid = max(all_used_gids) + 1 if all_used_gids else 1
 
         for gid, dup_labels in pkl_dups.items():
@@ -1630,7 +1632,10 @@ def _reconcile_session_group_ids():
                     f"'{n}' #{o}->#{nn}" for n, o, nn in dedup_moves),
                 0)
 
-    # 为 group_id=None 的 name 分配 gid
+    # 为 group_id=None 的 JSON / pkl label 分配 gid：
+    # 1) 同名 JSON 后续已有数字 gid，则沿用该 gid；
+    # 2) 否则尽量复用 pkl 里同名单实例的数字 gid；
+    # 3) 都没有时才分配新 gid。
     # 关键：考虑 pkl 中已有 label 的 gid，避免与"pkl 有但 JSON 没引用"的 label 撞车
     json_gids_used = set()
     for gids in name_to_gids.values():
@@ -1642,17 +1647,35 @@ def _reconcile_session_group_ids():
         pkl_name_count[label.name] += 1
     pkl_unique_gid = {}
     for label in ann.sam_handler.labels:
-        if pkl_name_count[label.name] == 1 and label.group_id not in json_gids_used:
+        if (pkl_name_count[label.name] == 1 and
+                isinstance(label.group_id, int) and
+                label.group_id not in json_gids_used):
             pkl_unique_gid[label.name] = label.group_id
 
     # 全部已用 gid = JSON 中的 + pkl 中的，next_gid 从最大值后跳
     all_existing_gids = set(json_gids_used)
     for label in ann.sam_handler.labels:
-        all_existing_gids.add(label.group_id)
+        if isinstance(label.group_id, int):
+            all_existing_gids.add(label.group_id)
     next_gid = max(all_existing_gids) + 1 if all_existing_gids else 1
 
-    none_gid_assigned = {}  # name → newly assigned gid
-    for name in names_with_none_gid:
+    pkl_names_with_none_gid = {
+        label.name for label in ann.sam_handler.labels
+        if label.group_id is None
+    }
+    names_to_resolve = set(names_with_none_gid) | pkl_names_with_none_gid
+
+    none_gid_assigned = {}  # name → resolved gid for old None group_id
+    ordered_names_to_resolve = []
+    seen_names_to_resolve = set()
+    for label in ann.sam_handler.labels:
+        if label.name in names_to_resolve and label.name not in seen_names_to_resolve:
+            ordered_names_to_resolve.append(label.name)
+            seen_names_to_resolve.add(label.name)
+    for name in sorted(names_to_resolve - seen_names_to_resolve):
+        ordered_names_to_resolve.append(name)
+
+    for name in ordered_names_to_resolve:
         if name in name_to_gids and name_to_gids[name]:
             # 该 name 已有 gid，取最小的
             none_gid_assigned[name] = min(name_to_gids[name])
@@ -1668,10 +1691,24 @@ def _reconcile_session_group_ids():
             none_gid_assigned[name] = gid
             name_to_gids[name].add(gid)
 
+    pkl_fixed_count = 0
+    if none_gid_assigned:
+        for label in ann.sam_handler.labels:
+            if label.group_id is None and label.name in none_gid_assigned:
+                label.group_id = none_gid_assigned[label.name]
+                pkl_fixed_count += 1
+        if pkl_fixed_count:
+            max_gid = max(
+                (lbl.group_id for lbl in ann.sam_handler.labels
+                 if isinstance(lbl.group_id, int)),
+                default=0)
+            ann.label_handler._next_group_id = max(
+                ann.label_handler._next_group_id, max_gid + 1)
+
     # 回写 JSON：把 group_id=None 修正为正确的数字
+    fixed_count = 0
     if none_gid_assigned:
         _show_progress(f"Fixing {len(names_with_none_gid)} label(s) with missing group_id...", 0)
-        fixed_count = 0
         for i, fname in enumerate(json_files):
             fpath = os.path.join(json_dir, fname)
             try:
@@ -1710,7 +1747,11 @@ def _reconcile_session_group_ids():
     for name, labels in pkl_name_to_labels.items():
         if name not in name_to_gids:
             continue
-        pkl_gids = sorted([l.group_id for l in labels])
+        raw_pkl_gids = [l.group_id for l in labels]
+        if any(not isinstance(gid, int) for gid in raw_pkl_gids):
+            errors.append(f"'{name}': pkl has unresolved group_id=None")
+            continue
+        pkl_gids = sorted(raw_pkl_gids)
         json_gids = sorted(name_to_gids[name])
         if len(pkl_gids) != len(json_gids):
             errors.append(
@@ -1731,7 +1772,7 @@ def _reconcile_session_group_ids():
     if errors:
         _show_progress("group_id mismatch: " + "; ".join(errors), 0)
 
-    if not remap and not missing and not dedup_moves:
+    if not remap and not missing and not dedup_moves and fixed_count == 0 and pkl_fixed_count == 0:
         if not errors:
             _show_progress("Reconcile: group_ids already consistent.", 100)
         return
@@ -1775,7 +1816,7 @@ def _reconcile_session_group_ids():
     # 更新计数器
     all_gids = set()
     for gids in name_to_gids.values():
-        all_gids.update(gids)
+        all_gids.update(gid for gid in gids if isinstance(gid, int))
     if all_gids:
         ann.label_handler._next_group_id = max(
             ann.label_handler._next_group_id,
@@ -1811,6 +1852,10 @@ def _reconcile_session_group_ids():
     parts = []
     if dedup_moves:
         parts.append(f"deduped {len(dedup_moves)} pkl group_id(s)")
+    if fixed_count:
+        parts.append(f"fixed group_id in {fixed_count} JSON file(s)")
+    if pkl_fixed_count:
+        parts.append(f"fixed {pkl_fixed_count} pkl label group_id(s)")
     if remap:
         parts.append(f"remapped {len(remap)} group_id(s)")
     if added:
