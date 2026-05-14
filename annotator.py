@@ -551,6 +551,44 @@ class Annotator:
         current_label = self.sam_handler.labels[self.curr_label_idx]
         if box_idx < len(current_label.boxes[self.current_block]):
             current_label.remove_box(box_idx,self.current_block)
+
+    def clear_label_mask_on_frame(self, abs_idx, group_id):
+        """Remove a single label's mask for one frame: in-memory + JSON.
+        Used to undo auto-generated masks when the user deletes all prompts.
+        Returns True if anything was removed."""
+        changed = False
+        # 1. in-memory
+        if abs_idx in self.masks and group_id in self.masks[abs_idx]:
+            del self.masks[abs_idx][group_id]
+            if not self.masks[abs_idx]:
+                del self.masks[abs_idx]
+            changed = True
+        # 2. JSON file on disk
+        json_path = os.path.join(self.project_dir, "jsons", f"{abs_idx:06d}.json")
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                old_n = len(data.get("shapes", []))
+                data["shapes"] = [s for s in data.get("shapes", [])
+                                  if s.get("group_id") != group_id]
+                if len(data["shapes"]) != old_n:
+                    changed = True
+                    if data["shapes"]:
+                        with open(json_path, "w", encoding="utf-8") as f:
+                            json.dump(data, f, ensure_ascii=False, indent=2)
+                    else:
+                        # no shapes left → drop the file
+                        os.remove(json_path)
+                        if hasattr(self, "_json_frames"):
+                            self._json_frames.discard(abs_idx)
+            except Exception as e:
+                print(f"clear_label_mask_on_frame JSON error: {e}")
+        # 3. invalidate render caches for this frame
+        if changed:
+            self.overlay_imgs.pop(abs_idx, None)
+            self.combined_masks.pop(abs_idx, None)
+        return changed
     
     # MODEL HANDLING
     

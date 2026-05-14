@@ -41,6 +41,8 @@ _right_click_start = None  # display coords at right-click down
 # inference state
 inference_busy = False
 inference_lock = threading.Lock()
+_auto_single_timer = None
+_auto_single_enabled = True
 
 # DPG context ready flag
 _dpg_ready = False
@@ -285,6 +287,122 @@ def _draw_timeline():
 # ── draw overlays (points, boxes) ────────────────────────────────────────────
 
 OVERLAY_NODE = "overlay_node"
+TOAST_NODE = "label_toast_node"
+_toast_timer = None
+
+
+def show_label_toast():
+    """Briefly show the current label name as a centered toast on the canvas."""
+    global _toast_timer
+    if not _dpg_ready:
+        return
+    if ann.curr_label_idx < 0 or ann.curr_label_idx >= len(ann.sam_handler.labels):
+        return
+    label = ann.sam_handler.labels[ann.curr_label_idx]
+    try:
+        hex_col = label.col or "#C8C8C8"
+        r = int(hex_col[1:3], 16)
+        g = int(hex_col[3:5], 16)
+        b = int(hex_col[5:7], 16)
+    except (ValueError, IndexError, TypeError):
+        r, g, b = 200, 200, 200
+
+    try:
+        if dpg.does_item_exist(TOAST_NODE):
+            dpg.delete_item(TOAST_NODE)
+        dpg.add_draw_node(parent=DRAW_TAG, tag=TOAST_NODE)
+
+        idx_text = f"#{ann.curr_label_idx:02d}"
+        name_text = label.name
+        size = 26
+        idx_size = 18
+        # rough text width estimates (DPG has no measure API)
+        # ASCII ≈ 0.55, CJK ≈ 1.05 of size
+        def _est_w(s, sz):
+            w = 0.0
+            for ch in s:
+                w += sz * (1.05 if ord(ch) > 0x2E80 else 0.55)
+            return int(w)
+        name_w = _est_w(name_text, size)
+        pad_x = 22
+        pad_y = 14
+        bar_w = 5            # left accent bar
+        bar_gap = 14
+        box_h = size + pad_y * 2
+        # content: [bar] [name] -- idx tag pinned to right
+        idx_tag_w = _est_w(idx_text, idx_size) + 14
+        idx_gap = 14
+        content_w = bar_w + bar_gap + name_w + idx_gap + idx_tag_w
+        box_w = content_w + pad_x * 2
+
+        cx = tex_w // 2
+        y_top = 32
+        x1 = cx - box_w // 2
+        y1 = y_top
+        x2 = x1 + box_w
+        y2 = y1 + box_h
+        radius = box_h // 2  # pill shape
+
+        # drop shadow (offset, very transparent)
+        dpg.draw_rectangle((x1 + 2, y1 + 4), (x2 + 2, y2 + 4),
+                           color=(0, 0, 0, 60), fill=(0, 0, 0, 60),
+                           rounding=radius, parent=TOAST_NODE)
+        # accent glow behind pill (uses label color, very low alpha)
+        dpg.draw_rectangle((x1 - 1, y1 - 1), (x2 + 1, y2 + 1),
+                           color=(r, g, b, 90), fill=(0, 0, 0, 0),
+                           rounding=radius + 1, thickness=2, parent=TOAST_NODE)
+        # main pill background
+        dpg.draw_rectangle((x1, y1), (x2, y2),
+                           color=(60, 60, 70, 230), fill=(28, 28, 34, 225),
+                           rounding=radius, thickness=1, parent=TOAST_NODE)
+
+        # left accent bar (rounded)
+        bar_x1 = x1 + pad_x
+        bar_y1 = y1 + pad_y - 2
+        bar_x2 = bar_x1 + bar_w
+        bar_y2 = y2 - pad_y + 2
+        dpg.draw_rectangle((bar_x1, bar_y1), (bar_x2, bar_y2),
+                           color=(r, g, b, 255), fill=(r, g, b, 255),
+                           rounding=bar_w // 2, parent=TOAST_NODE)
+
+        # label name (bright white)
+        name_x = bar_x2 + bar_gap
+        name_y = y1 + (box_h - size) // 2 - 3
+        dpg.draw_text((name_x, name_y), name_text,
+                      color=(245, 245, 250, 255), size=size, parent=TOAST_NODE)
+
+        # index tag pill on the right (dimmer)
+        tag_x2 = x2 - pad_x
+        tag_x1 = tag_x2 - idx_tag_w
+        tag_y1 = y1 + pad_y - 2
+        tag_y2 = y2 - pad_y + 2
+        tag_h = tag_y2 - tag_y1
+        dpg.draw_rectangle((tag_x1, tag_y1), (tag_x2, tag_y2),
+                           color=(0, 0, 0, 0), fill=(r, g, b, 55),
+                           rounding=tag_h // 2, parent=TOAST_NODE)
+        idx_x = tag_x1 + (idx_tag_w - _est_w(idx_text, idx_size)) // 2
+        idx_y = tag_y1 + (tag_h - idx_size) // 2 - 2
+        dpg.draw_text((idx_x, idx_y), idx_text,
+                      color=(r, g, b, 255), size=idx_size, parent=TOAST_NODE)
+    except Exception as e:
+        print(f"show_label_toast error: {e}")
+        return
+
+    def _clear():
+        try:
+            if dpg.does_item_exist(TOAST_NODE):
+                dpg.delete_item(TOAST_NODE)
+        except Exception:
+            pass
+
+    if _toast_timer is not None:
+        try:
+            _toast_timer.cancel()
+        except Exception:
+            pass
+    _toast_timer = threading.Timer(1.2, _clear)
+    _toast_timer.daemon = True
+    _toast_timer.start()
 
 
 def draw_overlays():
@@ -445,6 +563,7 @@ def cb_label_prev():
     update_status_bar()
     update_prompt_list()
     draw_overlays()
+    show_label_toast()
 
 
 def cb_label_next():
@@ -456,6 +575,7 @@ def cb_label_next():
     update_status_bar()
     update_prompt_list()
     draw_overlays()
+    show_label_toast()
 
 
 def cb_label_library(sender, app_data):
@@ -569,6 +689,7 @@ def cb_mouse_click(sender, app_data):
     ann.add_point_prompt_to_current_label(ix, iy, 1, ann.curr_img_idx)
     draw_overlays()
     update_prompt_list()
+    schedule_auto_single()
 
 
 def _draw_temp_box():
@@ -589,6 +710,7 @@ def _draw_temp_box():
                 ann.add_point_prompt_to_current_label(ix, iy, 0, ann.curr_img_idx)  # 0 = background
                 draw_overlays()
                 update_prompt_list()
+                schedule_auto_single()
             drag_start = None
             _right_click_start = None
         return
@@ -653,6 +775,7 @@ def _finish_drag():
     _right_click_start = None
     draw_overlays()
     update_prompt_list()
+    schedule_auto_single()
 
 
 # ── SAM2 inference (Step 4) ──────────────────────────────────────────────────
@@ -709,10 +832,66 @@ def _run_inference(task_fn):
     threading.Thread(target=wrapper, daemon=True).start()
 
 
+def _frame_has_prompts_for_current_label():
+    if ann.curr_label_idx < 0 or ann.curr_label_idx >= len(ann.sam_handler.labels):
+        return False
+    label = ann.sam_handler.labels[ann.curr_label_idx]
+    block = ann.current_block
+    frame = ann.curr_img_idx
+    if any(p.idx == frame for p in label.pts.get(block, [])):
+        return True
+    if any(b.idx == frame for b in label.boxes.get(block, [])):
+        return True
+    return False
+
+
+def _any_label_has_prompts_on_current_frame():
+    block = ann.current_block
+    frame = ann.curr_img_idx
+    for lbl in ann.sam_handler.labels:
+        if any(p.idx == frame for p in lbl.pts.get(block, [])):
+            return True
+        if any(b.idx == frame for b in lbl.boxes.get(block, [])):
+            return True
+    return False
+
+
+def schedule_auto_single(delay=0.12):
+    """Debounced auto single-frame inference after prompt edits."""
+    global _auto_single_timer
+    if not _auto_single_enabled:
+        return
+    if not _dpg_ready:
+        return
+    if not ann.model_status():
+        return
+    if _auto_single_timer is not None:
+        try:
+            _auto_single_timer.cancel()
+        except Exception:
+            pass
+    _auto_single_timer = threading.Timer(delay, _auto_single_fire)
+    _auto_single_timer.daemon = True
+    _auto_single_timer.start()
+
+
+def _auto_single_fire():
+    if inference_busy:
+        # try again shortly
+        schedule_auto_single(0.2)
+        return
+    if not ann.model_status():
+        return
+    if not _any_label_has_prompts_on_current_frame():
+        return
+    cb_single(None, None)
+
+
 def cb_single(sender, app_data):
     """Single frame mask generation."""
     if inference_busy:
-        _show_progress("Inference busy, please wait.", 0)
+        if sender is not None:
+            _show_progress("Inference busy, please wait.", 0)
         return
     if not ann.model_status():
         _show_progress("Model not loaded! Click 'Load Model' first.", 0)
@@ -1190,6 +1369,30 @@ def cb_clear_prompts():
     load_and_show_frame()
 
 
+def _post_prompt_edit():
+    """After any prompt edit on the current frame, refresh UI and either
+    schedule auto-inference, or — if the current label has no prompts left
+    on this frame — wipe its previously-auto-generated mask so the screen
+    matches what the user sees."""
+    draw_overlays()
+    update_prompt_list()
+    if ann.curr_label_idx < 0 or ann.curr_img_idx < 0:
+        return
+    label = ann.sam_handler.labels[ann.curr_label_idx]
+    block = ann.current_block
+    frame = ann.curr_img_idx
+    has_pt = any(p.idx == frame for p in label.pts.get(block, []))
+    has_box = any(b.idx == frame for b in label.boxes.get(block, []))
+    if has_pt or has_box:
+        schedule_auto_single()
+        return
+    # no prompts left for this label on this frame → drop its mask
+    abs_idx = ann._abs_idx(frame) if hasattr(ann, "_abs_idx") else (
+        ann.current_block * ann.block_size + frame)
+    if ann.clear_label_mask_on_frame(abs_idx, label.group_id):
+        load_and_show_frame()
+
+
 def cb_undo_last_prompt():
     """Undo the last added point or box for the current label on the current frame."""
     if ann.curr_label_idx < 0 or ann.curr_img_idx < 0:
@@ -1202,16 +1405,14 @@ def cb_undo_last_prompt():
     for i in range(len(pts) - 1, -1, -1):
         if pts[i].idx == frame:
             pts.pop(i)
-            draw_overlays()
-            update_prompt_list()
+            _post_prompt_edit()
             return
     # if no point found, try last box on this frame
     boxes = label.boxes.get(block, [])
     for i in range(len(boxes) - 1, -1, -1):
         if boxes[i].idx == frame:
             boxes.pop(i)
-            draw_overlays()
-            update_prompt_list()
+            _post_prompt_edit()
             return
 
 
@@ -1233,8 +1434,7 @@ def cb_delete_selected_prompt():
             ann.delete_selected_box(idx)
         except (ValueError, IndexError):
             pass
-    draw_overlays()
-    update_prompt_list()
+    _post_prompt_edit()
 
 
 # ── media loading ────────────────────────────────────────────────────────────

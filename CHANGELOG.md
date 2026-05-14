@@ -1,6 +1,11 @@
 # Changelog
 
 ## [Unreleased]
+### Added
+- **自动单帧推理**：添加 prompt（点 / 框）后自动触发 Single 推理，无需手动点 Single 按钮。带 ~120ms 去抖，连点多个点不会重复触发；推理正忙时排队等空闲后再跑；自动触发的推理失败/忙状态不再弹"Inference busy"。手动点 Single 行为保持不变
+- **删光 prompt 自动清 mask**：在当前帧通过 `Z`（撤回）或 `Delete`（删选中）把当前 label 在该帧的最后一个 point/box 删掉时，自动同步清掉该 label 在该帧之前自动生成的 mask（内存 + JSON 同步；JSON 内 shapes 清空后整个 JSON 文件一并删除，时间线蓝色标记消失），画面立即刷新与 prompts 一致。`annotator.py` 新增 `clear_label_mask_on_frame(abs_idx, group_id)` 工具方法
+- **W/S 切换 label 时弹窗显示当前 label**：画面顶部居中显示一个带 label 颜色色条 + 索引徽章的 pill toast（1.2s 自动消失），切 label 时不用再低头看左侧 Labels 列表就能确认当前选中的是哪个
+
 ### Fixed
 - **Reconcile Labels**: 修复旧版 pkl 中 label 已有 `group_id` 属性但值为 `None` 时无法被正确迁移的问题。现在 Reconcile 会同时解析 JSON 里的 `group_id=null` 和 pkl label 的 `group_id=None`：同名 JSON 后续已有数字 `group_id` 时优先沿用该值；同名器械全为 `None` 时才按 pkl label 顺序分配新实例 ID；已有数字 `group_id` 的正常项目保持不变。
 - **Reconcile Labels**: `group_id=None` 不再进入 gid 去重、`max()`、`sorted()` 和 remap 计算，避免旧 pkl 在 reconcile 过程中触发类型错误或把多个 label 误判成同一个实例。
