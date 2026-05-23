@@ -856,6 +856,19 @@ def _any_label_has_prompts_on_current_frame():
     return False
 
 
+def _cancel_auto_single_timer():
+    """Cancel a pending auto-single timer. Called on every frame-switch entry
+    so a deferred inference scheduled for the previous frame doesn't fire
+    after the user has moved on (which would race with curr_img_idx)."""
+    global _auto_single_timer
+    if _auto_single_timer is not None:
+        try:
+            _auto_single_timer.cancel()
+        except Exception:
+            pass
+        _auto_single_timer = None
+
+
 def schedule_auto_single(delay=0.12):
     """Debounced auto single-frame inference after prompt edits."""
     global _auto_single_timer
@@ -1192,6 +1205,7 @@ def cb_set_view_mode(mode_idx):
 def cb_frame_slider(sender, app_data):
     idx = int(app_data)
     if 0 <= idx < len(ann.media_files):
+        _cancel_auto_single_timer()
         ann.set_img(idx)
         load_and_show_frame()
 
@@ -1217,6 +1231,7 @@ def cb_jump_prev_prompt():
     prompt_frames = _get_prompt_frames()
     for i in range(ann.curr_img_idx - 1, -1, -1):
         if i in prompt_frames:
+            _cancel_auto_single_timer()
             ann.set_img(i)
             load_and_show_frame()
             return
@@ -1229,6 +1244,7 @@ def cb_jump_next_prompt():
     prompt_frames = _get_prompt_frames()
     for i in range(ann.curr_img_idx + 1, len(ann.media_files)):
         if i in prompt_frames:
+            _cancel_auto_single_timer()
             ann.set_img(i)
             load_and_show_frame()
             return
@@ -1324,19 +1340,23 @@ def _cb_goto_frame_apply(sender=None, app_data=None):
     target_block = target // ann.block_size
     target_local = target % ann.block_size
     if target_block != ann.current_block:
+        _cancel_auto_single_timer()
         ann.set_current_block(target_block)
         _reload_block()
     if 0 <= target_local < len(ann.media_files):
+        _cancel_auto_single_timer()
         ann.set_img(target_local)
         load_and_show_frame()
 
 
 def cb_prev_frame():
+    _cancel_auto_single_timer()
     ann.prev_img()
     load_and_show_frame()
 
 
 def cb_next_frame():
+    _cancel_auto_single_timer()
     ann.next_img()
     load_and_show_frame()
 

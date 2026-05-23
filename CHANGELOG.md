@@ -7,6 +7,10 @@
 - **W/S 切换 label 时弹窗显示当前 label**：画面顶部居中显示一个带 label 颜色色条 + 索引徽章的 pill toast（1.2s 自动消失），切 label 时不用再低头看左侧 Labels 列表就能确认当前选中的是哪个
 
 ### Fixed
+- **快速切帧导致 mask 错位写盘**：修复推理过程中（或自动单帧推理的 120ms 防抖窗口内）用户切帧/切 block 时，结果会被写到错误绝对帧号 JSON 的偶发竞态。该 bug 表现为"某些帧上突然出现不属于附近帧的 mask、关掉项目重开仍在"。
+  - `annotator.py` `generate_mask` 函数入口一次性快照 `curr_img_idx` 和 `current_block` 为本地变量，后续读取全部走快照，避免 719/722 两行先后读出不同值。
+  - `apply_masks` 新增 `_inference_block_snap` 字段读取（由 `generate_mask` / `propagate` 入口写入），按推理开始时的 block 计算 `abs_idx`，即使用户在 `apply_masks` 执行期间切了 block，结果仍写到正确的绝对帧号；并在写盘前校验源帧文件存在，不一致则 silently 丢弃，避免错位 JSON 永久残留。
+  - `main.py` 新增 `_cancel_auto_single_timer()`，在所有切帧入口（`cb_frame_slider`、Q/E 跳转、`cb_jump_to_frame`、`cb_prev_frame`/`cb_next_frame`、跨 block）调用一次，关闭"用户点完点立刻拖滑条"那段 120ms 防抖窗口的 race。
 - **Reconcile Labels**: 修复旧版 pkl 中 label 已有 `group_id` 属性但值为 `None` 时无法被正确迁移的问题。现在 Reconcile 会同时解析 JSON 里的 `group_id=null` 和 pkl label 的 `group_id=None`：同名 JSON 后续已有数字 `group_id` 时优先沿用该值；同名器械全为 `None` 时才按 pkl label 顺序分配新实例 ID；已有数字 `group_id` 的正常项目保持不变。
 - **Reconcile Labels**: `group_id=None` 不再进入 gid 去重、`max()`、`sorted()` 和 remap 计算，避免旧 pkl 在 reconcile 过程中触发类型错误或把多个 label 误判成同一个实例。
 - Fixed SAM2 mask over-expansion on Intel XPU by disabling autocast for XPU inference paths. XPU now runs SAM2 in float32 while CUDA keeps AMP enabled, avoiding the positive-logit drift that made masks cover most of the frame.

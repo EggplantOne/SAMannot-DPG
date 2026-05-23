@@ -637,11 +637,23 @@ class Annotator:
         n_skipped = 0
         json_dir = os.path.join(self.project_dir, "jsons")
         merged_idxs = set()
+        # Use the block snapshot taken when inference started (set by generate_mask
+        # /propagate). Falls back to current_block for callers that don't set it.
+        block_snap = getattr(self, "_inference_block_snap", None)
+        if block_snap is None:
+            block_snap = self.current_block
         for local_frame_idx, frame_masks in self.tracking_results.items():
             if local_frame_idx >= len(self.media_files):
                 continue
-            abs_idx = self._abs_idx(local_frame_idx)
+            abs_idx = block_snap * self.block_size + local_frame_idx
             frame_path = self.media_files[local_frame_idx]
+            # Sanity check: the abs_idx must map back to a valid local frame in
+            # this block, and the source file must still exist. If not, the
+            # state changed mid-flight — drop silently rather than persist
+            # a misaligned mask to disk.
+            if not isinstance(frame_path, str) or not os.path.exists(frame_path):
+                print(f"[apply_masks] skip local={local_frame_idx} abs={abs_idx}: source frame missing")
+                continue
             if merge:
                 # Merge mode: write each label's mask into existing JSON
                 try:
@@ -711,15 +723,21 @@ class Annotator:
             return False, []
         if self.curr_label_idx < 0 or len(self.media_files) < 0:
             return False, []
-        labels_with_points = [label for label in self.sam_handler.labels if len(label.pts.get(self.current_block, [])) > 0]
-        labels_with_boxes = [label for label in self.sam_handler.labels if len(label.boxes.get(self.current_block, [])) > 0]
+        # Snapshot frame/block once — guards against the user switching frames
+        # while this runs. All subsequent reads use these locals.
+        frame_idx = self.curr_img_idx
+        block = self.current_block
+        labels_with_points = [label for label in self.sam_handler.labels if len(label.pts.get(block, [])) > 0]
+        labels_with_boxes = [label for label in self.sam_handler.labels if len(label.boxes.get(block, [])) > 0]
         if not labels_with_points and not labels_with_boxes:
             return False, []
         self.sam_handler.media_files = self.media_files
-        self.sam_handler.curr_img_idx = self.curr_img_idx
-        self.sam_handler.current_block = self.current_block
+        self.sam_handler.curr_img_idx = frame_idx
+        self.sam_handler.current_block = block
         self.sam_handler.sam_extract_dir = self.sam_extract_dir
-        self.tracking_results = self.sam_handler.generate_mask_for_frame(self.curr_img_idx,0)
+        self.tracking_results = self.sam_handler.generate_mask_for_frame(frame_idx, 0)
+        # Stash snapshot so apply_masks can use the same block when computing abs_idx
+        self._inference_block_snap = block
         if not self.tracking_results:  # {} 和 None 都当失败
             self.mode = "prompts"
             return False, []
@@ -727,9 +745,12 @@ class Annotator:
             for group_id, _ in v.items():
                 li = self.get_label_idx_by_group_id(group_id)
                 if li >= 0:
-                    self.sam_handler.labels[li].prop_frames[self.current_block].add(k)
+                    self.sam_handler.labels[li].prop_frames[block].add(k)
         return True, list(self.tracking_results.keys())
     def propagate(self,flag,update_progress_callback):
+        # Snapshot block at the start so apply_masks writes to the right abs_idx
+        # even if the user switches blocks during propagation.
+        self._inference_block_snap = self.current_block
         if flag == 0:
             self.tracking_results = self.sam_handler.propagate_to_all(
                 current_frame_idx=self.curr_img_idx,
