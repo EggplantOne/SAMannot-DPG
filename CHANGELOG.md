@@ -18,6 +18,7 @@
 - Moved inference busy/progress UI updates back onto the DearPyGui main thread to avoid missing progress updates and native UI crashes from worker-thread DPG calls.
 
 ### Changed
+- **View 模式切换改为单键 1/2/3/4**：之前需要 Shift+1/2/3/4，现在直接按数字键即可切换 Original / Prompts / Overlay / Mask。输入框焦点内的数字输入不受影响（`_is_input_focused()` 已在键盘 handler 顶部拦截）。README、左侧 View 区域 collapsing header 标题同步更新。
 - Added concise terminal logs for SAM2 model loading, checkpoint selection, and load failures.
 
 ### Verified

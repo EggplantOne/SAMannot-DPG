@@ -298,7 +298,7 @@ python main.py
 
 ### 7. 查看结果
 
-用 **Shift+1/2/3/4** 或左侧 View 区按钮切换视图：
+用 **1/2/3/4** 或左侧 View 区按钮切换视图：
 
 | 视图 | 说明 |
 |------|------|
@@ -391,7 +391,7 @@ python main.py
 | `C` | 清空当前帧所有标签的标注（同时删除该帧 JSON） |
 | `Z` | 撤回当前标签在当前帧的最后一个标注点 |
 | `Delete` | 删除选中的标注 |
-| `Shift+1/2/3/4` | 切换视图模式（Original/Prompt/Overlay/Mask） |
+| `1/2/3/4` | 切换视图模式（Original/Prompt/Overlay/Mask） |
 | `F11` | 全屏 / 退出全屏 |
 | `Ctrl+S` | 保存 session |
 | `Esc` | 清除输入框焦点（恢复快捷键） |

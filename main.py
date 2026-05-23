@@ -1269,27 +1269,25 @@ def cb_key_handler(sender, app_data):
         return
 
     ctrl = dpg.is_key_down(dpg.mvKey_LControl) or dpg.is_key_down(dpg.mvKey_RControl)
-    shift = dpg.is_key_down(dpg.mvKey_LShift) or dpg.is_key_down(dpg.mvKey_RShift)
 
     if ctrl:
         if key == dpg.mvKey_S:
             cb_save_session(None, None)
             return
 
-    if shift:
-        # Shift+1/2/3/4 → view mode
-        if key == dpg.mvKey_1:
-            cb_set_view_mode(0)  # original
-            return
-        elif key == dpg.mvKey_2:
-            cb_set_view_mode(1)  # prompts
-            return
-        elif key == dpg.mvKey_3:
-            cb_set_view_mode(2)  # overlay
-            return
-        elif key == dpg.mvKey_4:
-            cb_set_view_mode(3)  # masks
-            return
+    # 1/2/3/4 → view mode (input fields are already filtered by _is_input_focused above)
+    if key == dpg.mvKey_1:
+        cb_set_view_mode(0)  # original
+        return
+    elif key == dpg.mvKey_2:
+        cb_set_view_mode(1)  # prompts
+        return
+    elif key == dpg.mvKey_3:
+        cb_set_view_mode(2)  # overlay
+        return
+    elif key == dpg.mvKey_4:
+        cb_set_view_mode(3)  # masks
+        return
 
     if key == dpg.mvKey_A:
         cb_prev_frame()
@@ -2894,7 +2892,7 @@ def build_ui():
                     dpg.add_progress_bar(tag="progress_bar", default_value=0, width=-1)
 
                 # ── View ──
-                with dpg.collapsing_header(label="View (Shift+1/2/3/4)", default_open=True):
+                with dpg.collapsing_header(label="View (1/2/3/4)", default_open=True):
                     with dpg.group(horizontal=True):
                         dpg.add_button(label="Original",
                                        callback=lambda: cb_set_view_mode(0), width=50)
