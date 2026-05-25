@@ -1200,6 +1200,29 @@ def cb_set_view_mode(mode_idx):
     load_and_show_frame()
 
 
+def cb_set_mask_alpha(sender, app_data):
+    """Update overlay mask alpha and refresh the canvas if overlay is active."""
+    try:
+        ann.mask_alpha = float(app_data)
+    except (TypeError, ValueError):
+        return
+    # Invalidate any cached overlay/composite renders so the new alpha takes effect.
+    ann.overlay_imgs = {}
+    if ann.view_mode == "overlay":
+        load_and_show_frame()
+
+
+def _sync_mask_alpha_slider():
+    """Push ann.mask_alpha into the slider widget (called after session load)."""
+    if not _dpg_ready:
+        return
+    try:
+        if dpg.does_item_exist("mask_alpha_slider"):
+            dpg.set_value("mask_alpha_slider", float(getattr(ann, "mask_alpha", 0.5)))
+    except Exception:
+        pass
+
+
 # ── navigation (Step 6) ─────────────────────────────────────────────────────
 
 def cb_frame_slider(sender, app_data):
@@ -2902,6 +2925,10 @@ def build_ui():
                                        callback=lambda: cb_set_view_mode(2), width=50)
                         dpg.add_button(label="Mask",
                                        callback=lambda: cb_set_view_mode(3), width=50)
+                    dpg.add_slider_float(label="Mask alpha",
+                                         tag="mask_alpha_slider",
+                                         default_value=0.5, min_value=0.0, max_value=1.0,
+                                         width=-80, callback=cb_set_mask_alpha)
 
                 # ── Export ──
                 with dpg.collapsing_header(label="Export", default_open=False):
@@ -2977,6 +3004,7 @@ def build_ui():
             except Exception:
                 pass
             refresh_label_listbox()
+            _sync_mask_alpha_slider()
             load_and_show_frame()
             _show_progress(f"Session loaded: {ann.session_name} "
                            f"({len(ann.media_files)} frames)", 100)

@@ -31,6 +31,8 @@ class Annotator:
         self.overlay_imgs = {}
         self.combined_masks = {}
         self.cache_images = True
+        self.mask_alpha = 0.5  # blending alpha for overlay view (cv2.addWeighted)
+        self._overlay_blend_cache = None  # per-frame cache of (img_rgb, combined, mask_bin) for fast alpha drag
         self.current_img_width = 0
         self.current_img_height = 0
 
@@ -68,6 +70,7 @@ class Annotator:
         self.original_img = None
         self.overlay_imgs = {}
         self.combined_masks = {}
+        self._overlay_blend_cache = None
         self.masks = {}
         self.tracking_results = {}
         self.label_handler = Label_Handler()
@@ -161,6 +164,8 @@ class Annotator:
         self.extra_frame_path = dict_representation["extra_frame_path"]
         self.extra_frame = dict_representation["extra_frame"]
         self.extra_frame_masks = dict_representation["extra_frame_masks"]
+        # mask_alpha: optional (older pkl files don't have it — default to 0.5)
+        self.mask_alpha = dict_representation.get("mask_alpha", 0.5)
     def compress_to_dict(self):
         dict_representation = {
             "session_name": self.session_name,
@@ -191,6 +196,7 @@ class Annotator:
             "extra_frame_path": self.extra_frame_path,
             "extra_frame": self.extra_frame,
             "extra_frame_masks": self.extra_frame_masks,
+            "mask_alpha": self.mask_alpha,
             "sam_handler_labels": self.sam_handler.labels,
             "sam_handler_object_id_to_group_id": self.sam_handler.object_id_to_group_id,
             "sam_handler_media_files": self.sam_handler.media_files,
@@ -212,6 +218,7 @@ class Annotator:
         if value == False:
             self.overlay_imgs = {}
             self.combined_masks = {}
+            self._overlay_blend_cache = None
             gc.collect()
         self.cache_images = value
     def check_label_existence(self, label_name):
@@ -563,6 +570,9 @@ class Annotator:
             if not self.masks[abs_idx]:
                 del self.masks[abs_idx]
             changed = True
+        # invalidate per-frame overlay blend cache so the next render rebuilds it
+        if self._overlay_blend_cache is not None and self._overlay_blend_cache.get("abs_idx") == abs_idx:
+            self._overlay_blend_cache = None
         # 2. JSON file on disk
         json_path = os.path.join(self.project_dir, "jsons", f"{abs_idx:06d}.json")
         if os.path.exists(json_path):
@@ -692,6 +702,7 @@ class Annotator:
             self._json_frames = getattr(self, '_json_frames', set()) | merged_idxs
             self.overlay_imgs = {}
             self.combined_masks = {}
+            self._overlay_blend_cache = None
             self.mode = "correction"
             self.view_mode = "overlay"
             import gc; gc.collect()
@@ -707,6 +718,7 @@ class Annotator:
             self.masks = {}
             self.overlay_imgs = {}
             self.combined_masks = {}
+            self._overlay_blend_cache = None
             self.mode = "correction"
             self.view_mode = "overlay"
             import gc; gc.collect()
@@ -1458,20 +1470,41 @@ class Annotator:
             return None
 
     def create_overlay_img(self, abs_idx=None, overwrite=False):
-        """渲染 overlay：原图 + 半透明 mask。从 JSON 或内存 masks 渲染。"""
-        alpha = 0.5
+        """渲染 overlay：原图 + 半透明 mask。从 JSON 或内存 masks 渲染。
+
+        Additive blending (img * 1 + mask * alpha) — the additive look keeps
+        the original colors visible while tinting them with the mask hue.
+
+        Caches per-frame disk read + polygon raster between calls so dragging
+        the mask_alpha slider only redoes the cheap blend step. Cache is
+        invalidated whenever masks/overlay_imgs are reset (mask edits, frame
+        switch via load_and_show_frame, etc.).
+        """
+        alpha = float(getattr(self, "mask_alpha", 0.5))
         if abs_idx is None:
             abs_idx = self._current_abs_idx()
-        file_path = self._path_for_abs_idx(abs_idx)
-        if not os.path.exists(file_path):
-            return None
-        img_rgb = cv2.cvtColor(cv2.imread(file_path), cv2.COLOR_BGR2RGB)
+        cache = getattr(self, "_overlay_blend_cache", None)
+        if (not overwrite and cache is not None
+                and cache.get("abs_idx") == abs_idx):
+            img_rgb = cache["img_rgb"]
+            combined = cache["combined"]
+        else:
+            file_path = self._path_for_abs_idx(abs_idx)
+            if not os.path.exists(file_path):
+                return None
+            img_rgb = cv2.cvtColor(cv2.imread(file_path), cv2.COLOR_BGR2RGB)
+            self.curr_img_shape = img_rgb.shape
+            combined = self.create_combined_mask(abs_idx, overwrite=overwrite)
+            if combined is None:
+                self._overlay_blend_cache = None
+                return None
+            self._overlay_blend_cache = {
+                "abs_idx": abs_idx,
+                "img_rgb": img_rgb,
+                "combined": combined,
+            }
         self.curr_img_shape = img_rgb.shape
-        combined = self.create_combined_mask(abs_idx, overwrite=overwrite)
-        if combined is None:
-            return None
-        blended = cv2.addWeighted(img_rgb, 1, combined, alpha, 0)
-        return blended
+        return cv2.addWeighted(img_rgb, 1, combined, alpha, 0)
 
     def create_combined_mask(self, abs_idx=None, overwrite=False):
         """渲染合成 mask。优先从内存 masks 读，其次从 JSON 读。"""
