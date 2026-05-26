@@ -8,6 +8,7 @@
 - **W/S 切换 label 时弹窗显示当前 label**：画面顶部居中显示一个带 label 颜色色条 + 索引徽章的 pill toast（1.2s 自动消失），切 label 时不用再低头看左侧 Labels 列表就能确认当前选中的是哪个
 
 ### Fixed
+- 2026-05-26: Fixed prompt points/boxes being visible in both Original (1) and Prompts (2) view modes. Original view now keeps the frame clean while Prompts view remains the only mode that draws prompt overlays.
 - **快速切帧导致 mask 错位写盘**：修复推理过程中（或自动单帧推理的 120ms 防抖窗口内）用户切帧/切 block 时，结果会被写到错误绝对帧号 JSON 的偶发竞态。该 bug 表现为"某些帧上突然出现不属于附近帧的 mask、关掉项目重开仍在"。
   - `annotator.py` `generate_mask` 函数入口一次性快照 `curr_img_idx` 和 `current_block` 为本地变量，后续读取全部走快照，避免 719/722 两行先后读出不同值。
   - `apply_masks` 新增 `_inference_block_snap` 字段读取（由 `generate_mask` / `propagate` 入口写入），按推理开始时的 block 计算 `abs_idx`，即使用户在 `apply_masks` 执行期间切了 block，结果仍写到正确的绝对帧号；并在写盘前校验源帧文件存在，不一致则 silently 丢弃，避免错位 JSON 永久残留。

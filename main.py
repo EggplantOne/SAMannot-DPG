@@ -428,8 +428,8 @@ def draw_overlays():
     except Exception:
         pass
 
-    # only draw prompts in prompts view mode
-    if ann.view_mode not in ("prompts", "original"):
+    # only draw prompt points/boxes in prompts view mode
+    if ann.view_mode != "prompts":
         return
     block = ann.current_block
     frame_idx = ann.curr_img_idx
