@@ -9,8 +9,11 @@ import math
 import json
 import pickle
 import subprocess
+from datetime import datetime
 
 from annotator import Annotator
+from label import Label_Handler, PBox, PPoint
+from safe_io import atomic_json_dump, atomic_pickle_dump
 
 # ── globals ──────────────────────────────────────────────────────────────────
 ann = Annotator()
@@ -469,8 +472,7 @@ def load_label_presets():
 
 
 def save_label_presets(presets):
-    with open(LABEL_PRESETS_FILE, "w", encoding="utf-8") as f:
-        json.dump(presets, f, ensure_ascii=False, indent=2)
+    atomic_json_dump(presets, LABEL_PRESETS_FILE, ensure_ascii=False, indent=2)
 
 
 def refresh_label_listbox():
@@ -542,6 +544,7 @@ def cb_add_label(sender, app_data):
     refresh_label_listbox()
     update_status_bar()
     draw_overlays()
+    _autosave_session_state_json()
 
 
 def cb_remove_label(sender, app_data):
@@ -552,6 +555,7 @@ def cb_remove_label(sender, app_data):
     update_status_bar()
     update_prompt_list()
     draw_overlays()
+    _autosave_session_state_json()
 
 
 def cb_label_prev():
@@ -623,6 +627,7 @@ def _cb_lib_delete(sender, app_data, user_data):
     update_status_bar()
     update_prompt_list()
     draw_overlays()
+    _autosave_session_state_json()
     # rebuild the dialog to reflect changes
     _rebuild_lib_window()
 
@@ -648,6 +653,7 @@ def _cb_lib_apply(sender, app_data, user_data):
     update_status_bar()
     update_prompt_list()
     draw_overlays()
+    _autosave_session_state_json()
 
 
 # ── mouse interaction ────────────────────────────────────────────────────────
@@ -689,6 +695,7 @@ def cb_mouse_click(sender, app_data):
     ann.add_point_prompt_to_current_label(ix, iy, 1, ann.curr_img_idx)
     draw_overlays()
     update_prompt_list()
+    _autosave_session_state_json()
     schedule_auto_single()
 
 
@@ -710,6 +717,7 @@ def _draw_temp_box():
                 ann.add_point_prompt_to_current_label(ix, iy, 0, ann.curr_img_idx)  # 0 = background
                 draw_overlays()
                 update_prompt_list()
+                _autosave_session_state_json()
                 schedule_auto_single()
             drag_start = None
             _right_click_start = None
@@ -770,6 +778,7 @@ def _finish_drag():
         x1, x2 = min(fx, ix), max(fx, ix)
         y1, y2 = min(fy, iy), max(fy, iy)
         ann.add_box_prompt_to_current_label(x1, y1, x2, y2, 1, ann.curr_img_idx)
+        _autosave_session_state_json()
     dragging = False
     drag_start = None
     _right_click_start = None
@@ -1407,6 +1416,7 @@ def cb_clear_prompts():
     for label in ann.sam_handler.labels:
         pf = label.prop_frames.get(block, set())
         pf.discard(frame_idx)
+    _autosave_session_state_json()
     load_and_show_frame()
 
 
@@ -1417,6 +1427,7 @@ def _post_prompt_edit():
     matches what the user sees."""
     draw_overlays()
     update_prompt_list()
+    _autosave_session_state_json()
     if ann.curr_label_idx < 0 or ann.curr_img_idx < 0:
         return
     label = ann.sam_handler.labels[ann.curr_label_idx]
@@ -1482,6 +1493,7 @@ def cb_delete_selected_prompt():
 
 # store file_path for block switching
 _loaded_file_path = ""
+_loaded_session_path = ""
 _max_frame = 0
 
 
@@ -1495,12 +1507,13 @@ class _ProgressVar:
 
 
 def _do_load_media(file_path, block_size):
-    global _loaded_file_path, _max_frame
+    global _loaded_file_path, _loaded_session_path, _max_frame
     # 切到新项目（没有 pkl 的路径）：先清空上一个项目残留的 labels / masks /
     # tracking_results 等状态，否则旧 label 会留在 UI 里。session pkl 加载走
     # _load_session_from_path → load_from_dict，自带状态替换，不需要这一步。
     ann.reset()
     _loaded_file_path = file_path
+    _loaded_session_path = ""
     ann.block_size = block_size
 
     ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
@@ -1758,8 +1771,7 @@ def cb_save_session(sender, app_data):
     session_name = ann.session_name or "session"
     path = os.path.join(ann.project_dir, f"{session_name}.pkl")
     data = ann.compress_to_dict()
-    with open(path, "wb") as f:
-        pickle.dump(data, f)
+    _save_session_pickle(path, data)
     _show_progress(f"Saved: {path}", 100)
 
 
@@ -1770,14 +1782,331 @@ def _autosave_pkl():
         return False
     try:
         os.makedirs(ann.project_dir, exist_ok=True)
-        session_name = ann.session_name or "session"
-        pkl_path = os.path.join(ann.project_dir, f"{session_name}.pkl")
-        with open(pkl_path, "wb") as f:
-            pickle.dump(ann.compress_to_dict(), f)
+        pkl_path = _session_save_path()
+        _save_session_pickle(pkl_path, ann.compress_to_dict())
         return True
     except Exception as e:
         print(f"[autosave] failed: {e}")
         return False
+
+
+def _session_save_path():
+    if _loaded_session_path:
+        return _loaded_session_path
+    session_name = ann.session_name or "session"
+    return os.path.join(ann.project_dir, f"{session_name}.pkl")
+
+
+def _session_state_json_path(pkl_path=None):
+    pkl_path = pkl_path or _session_save_path()
+    stem, _ = os.path.splitext(pkl_path)
+    return f"{stem}.session_state.json"
+
+
+def _session_state_payload(pkl_path=None):
+    block_size = ann.block_size or 0
+
+    def as_int(value):
+        return None if value is None else int(value)
+
+    def abs_idx(block, local_idx):
+        return int(block) * block_size + int(local_idx)
+
+    def sorted_items(d):
+        return sorted((d or {}).items(), key=lambda kv: int(kv[0]))
+
+    def serialize_pts(label):
+        out = {}
+        for block, items in sorted_items(getattr(label, "pts", {})):
+            rows = []
+            for pt in items or []:
+                idx = int(pt.idx)
+                rows.append({
+                    "idx": idx,
+                    "abs_idx": abs_idx(block, idx),
+                    "x": float(pt.x),
+                    "y": float(pt.y),
+                    "pt_type": int(pt.pt_type),
+                })
+            if rows:
+                out[str(int(block))] = rows
+        return out
+
+    def serialize_boxes(label):
+        out = {}
+        for block, items in sorted_items(getattr(label, "boxes", {})):
+            rows = []
+            for box in items or []:
+                idx = int(box.idx)
+                rows.append({
+                    "idx": idx,
+                    "abs_idx": abs_idx(block, idx),
+                    "fx": float(box.fx),
+                    "fy": float(box.fy),
+                    "x": float(box.x),
+                    "y": float(box.y),
+                    "pt_type": int(box.pt_type),
+                })
+            if rows:
+                out[str(int(block))] = rows
+        return out
+
+    def serialize_frame_sets(d):
+        out = {}
+        for block, frames in sorted_items(d):
+            rows = sorted(int(x) for x in (frames or []))
+            if rows:
+                out[str(int(block))] = rows
+        return out
+
+    labels = []
+    for label in ann.sam_handler.labels:
+        labels.append({
+            "name": label.name,
+            "color": label.col,
+            "group_id": as_int(label.group_id),
+            "pts": serialize_pts(label),
+            "boxes": serialize_boxes(label),
+            "prop_frames": serialize_frame_sets(getattr(label, "prop_frames", {})),
+        })
+
+    return {
+        "schema": "samannot_session_state_v1",
+        "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "source_pkl": pkl_path or _session_save_path(),
+        "session_name": ann.session_name,
+        "media_path": ann.media_path,
+        "video_name": ann.video_name,
+        "block_size": as_int(ann.block_size),
+        "current_block": as_int(ann.current_block),
+        "curr_img_idx": as_int(ann.curr_img_idx),
+        "current_abs_idx": as_int(ann._current_abs_idx()) if ann.curr_img_idx >= 0 else None,
+        "num_blocks": as_int(ann.num_blocks),
+        "curr_label_idx": as_int(ann.curr_label_idx),
+        "current_img_width": as_int(ann.current_img_width),
+        "current_img_height": as_int(ann.current_img_height),
+        "curr_img_shape": [int(x) for x in ann.curr_img_shape],
+        "extra_frame_path": {
+            str(int(k)): v for k, v in sorted_items(ann.extra_frame_path)
+        },
+        "propagation_blocks": {
+            str(int(k)): sorted(int(x) for x in (v or {}).keys())
+            for k, v in sorted_items(ann.sam_handler.propagation_blocks)
+            if v
+        },
+        "labels": labels,
+    }
+
+
+def _write_session_state_json(pkl_path=None):
+    pkl_path = pkl_path or _session_save_path()
+    atomic_json_dump(_session_state_payload(pkl_path), _session_state_json_path(pkl_path))
+
+
+def _autosave_session_state_json():
+    if not ann.session_name or not ann.media_files:
+        return False
+    try:
+        os.makedirs(ann.project_dir, exist_ok=True)
+        _write_session_state_json()
+        return True
+    except Exception as e:
+        print(f"[session-state] failed: {e}")
+        return False
+
+
+def _save_session_pickle(pkl_path, data):
+    atomic_pickle_dump(data, pkl_path)
+    try:
+        _write_session_state_json(pkl_path)
+    except Exception as e:
+        print(f"[session-state] failed: {e}")
+
+
+def _dict_from_session_state_json(pkl_path):
+    state_path = _session_state_json_path(pkl_path)
+    if not os.path.exists(state_path):
+        return None
+    with open(state_path, "r", encoding="utf-8") as f:
+        state = json.load(f)
+    if state.get("schema") != "samannot_session_state_v1":
+        return None
+
+    num_blocks = int(state.get("num_blocks") or 1)
+    block_size = int(state.get("block_size") or 0)
+    label_handler = Label_Handler()
+    labels = []
+
+    for label_data in state.get("labels", []):
+        label = label_handler.create_new_label(
+            label_data.get("name", ""),
+            group_id=label_data.get("group_id"),
+            color=label_data.get("color"),
+        )
+        label.pts = {i: [] for i in range(num_blocks)}
+        label.boxes = {i: [] for i in range(num_blocks)}
+        label.prop_frames = {i: set() for i in range(num_blocks)}
+
+        for block, rows in (label_data.get("pts") or {}).items():
+            block_idx = int(block)
+            label.pts.setdefault(block_idx, [])
+            for row in rows or []:
+                label.pts[block_idx].append(PPoint(
+                    float(row["x"]),
+                    float(row["y"]),
+                    int(row["pt_type"]),
+                    int(row["idx"]),
+                ))
+
+        for block, rows in (label_data.get("boxes") or {}).items():
+            block_idx = int(block)
+            label.boxes.setdefault(block_idx, [])
+            for row in rows or []:
+                label.boxes[block_idx].append(PBox(
+                    float(row["fx"]),
+                    float(row["fy"]),
+                    float(row["x"]),
+                    float(row["y"]),
+                    int(row["pt_type"]),
+                    int(row["idx"]),
+                ))
+
+        for block, rows in (label_data.get("prop_frames") or {}).items():
+            label.prop_frames[int(block)] = {int(x) for x in rows or []}
+
+        labels.append(label)
+
+    max_gid = max(
+        (label.group_id for label in labels if isinstance(label.group_id, int)),
+        default=0,
+    )
+    label_handler._next_group_id = max(label_handler._next_group_id, max_gid + 1)
+
+    propagation_blocks = {i: {} for i in range(num_blocks)}
+    for block, rows in (state.get("propagation_blocks") or {}).items():
+        propagation_blocks[int(block)] = {int(x): 1 for x in rows or []}
+
+    return {
+        "session_name": state.get("session_name") or os.path.splitext(os.path.basename(pkl_path))[0],
+        "view_mode": "prompts",
+        "mode": "prompts",
+        "media_files": [],
+        "curr_img_idx": int(state.get("curr_img_idx") or 0),
+        "overlay_img": None,
+        "overlay_imgs": {},
+        "combined_masks": {},
+        "original_img": None,
+        "composite_mask": None,
+        "masks": {},
+        "idx_to_path": {},
+        "temp_dir": None,
+        "current_img_width": int(state.get("current_img_width") or 0),
+        "current_img_height": int(state.get("current_img_height") or 0),
+        "label_handler": label_handler,
+        "curr_label_idx": int(state.get("curr_label_idx") or 0),
+        "tracking_results": {},
+        "cache_images": True,
+        "media_path": state.get("media_path") or ".",
+        "video_name": state.get("video_name") or "",
+        "block_size": block_size,
+        "current_block": int(state.get("current_block") or 0),
+        "num_blocks": num_blocks,
+        "curr_img_shape": tuple(state.get("curr_img_shape") or (0, 0, 0)),
+        "extra_frame_path": {
+            int(k): v for k, v in (state.get("extra_frame_path") or {}).items()
+        },
+        "extra_frame": {},
+        "extra_frame_masks": {},
+        "mask_alpha": 0.5,
+        "sam_handler_labels": labels,
+        "sam_handler_object_id_to_group_id": {},
+        "sam_handler_media_files": [],
+        "sam_handler_curr_img_idx": int(state.get("curr_img_idx") or 0),
+        "sam_handler_current_stage": 0,
+        "sam_handler_model_loaded": False,
+        "sam_handler_model_loading": False,
+        "sam_handler_propagation_blocks": propagation_blocks,
+    }
+
+
+def _remap_block_indexed_state(old_block_size, new_block_size, total_frames):
+    if old_block_size <= 0 or new_block_size <= 0 or old_block_size == new_block_size:
+        return False
+
+    current_abs = ann.current_block * old_block_size + ann.curr_img_idx
+    num_blocks = max(1, math.ceil(total_frames / new_block_size)) if total_frames > 0 else ann.num_blocks
+
+    def empty_blocks():
+        return {i: set() for i in range(num_blocks)}
+
+    for label in ann.sam_handler.labels:
+        new_pts = {i: [] for i in range(num_blocks)}
+        for old_block, items in (getattr(label, "pts", {}) or {}).items():
+            for pt in items or []:
+                abs_idx = int(old_block) * old_block_size + int(pt.idx)
+                if total_frames > 0 and not (0 <= abs_idx < total_frames):
+                    continue
+                new_block = abs_idx // new_block_size
+                if 0 <= new_block < num_blocks:
+                    pt.idx = abs_idx % new_block_size
+                    new_pts[new_block].append(pt)
+        label.pts = new_pts
+
+        new_boxes = {i: [] for i in range(num_blocks)}
+        for old_block, items in (getattr(label, "boxes", {}) or {}).items():
+            for box in items or []:
+                abs_idx = int(old_block) * old_block_size + int(box.idx)
+                if total_frames > 0 and not (0 <= abs_idx < total_frames):
+                    continue
+                new_block = abs_idx // new_block_size
+                if 0 <= new_block < num_blocks:
+                    box.idx = abs_idx % new_block_size
+                    new_boxes[new_block].append(box)
+        label.boxes = new_boxes
+
+        new_prop_frames = empty_blocks()
+        for old_block, frames in (getattr(label, "prop_frames", {}) or {}).items():
+            for local_idx in frames or []:
+                abs_idx = int(old_block) * old_block_size + int(local_idx)
+                if total_frames > 0 and not (0 <= abs_idx < total_frames):
+                    continue
+                new_block = abs_idx // new_block_size
+                if 0 <= new_block < num_blocks:
+                    new_prop_frames[new_block].add(abs_idx % new_block_size)
+        label.prop_frames = new_prop_frames
+
+    new_prop_blocks = {i: {} for i in range(num_blocks)}
+    for old_block, frames in (ann.sam_handler.propagation_blocks or {}).items():
+        for local_idx, value in (frames or {}).items():
+            abs_idx = int(old_block) * old_block_size + int(local_idx)
+            if total_frames > 0 and not (0 <= abs_idx < total_frames):
+                continue
+            new_block = abs_idx // new_block_size
+            if 0 <= new_block < num_blocks:
+                new_prop_blocks[new_block][abs_idx % new_block_size] = value
+    ann.sam_handler.propagation_blocks = new_prop_blocks
+
+    ann.block_size = new_block_size
+    ann.sam_handler.current_block = ann.current_block
+    ann.num_blocks = num_blocks
+    if total_frames > 0:
+        current_abs = min(max(current_abs, 0), total_frames - 1)
+    ann.current_block = min(max(current_abs // new_block_size, 0), num_blocks - 1)
+    ann.sam_handler.current_block = ann.current_block
+    ann.curr_img_idx = current_abs % new_block_size
+    ann.sam_handler.curr_img_idx = ann.curr_img_idx
+
+    ann.extra_frame_path = {}
+    frames_dir = ann.frames_dir
+    for block in range(num_blocks):
+        extra_abs = (block + 1) * new_block_size
+        extra_fp = os.path.join(frames_dir, f"{extra_abs:06d}.jpg")
+        ann.extra_frame_path[block] = extra_fp if os.path.exists(extra_fp) else None
+    ann.extra_frame = {}
+    ann.extra_frame_masks = {}
+    ann.sam_handler.object_ids = {}
+    ann.sam_handler.object_id_to_group_id = {}
+    return True
 
 
 def _reconcile_session_group_ids():
@@ -1787,7 +2116,7 @@ def _reconcile_session_group_ids():
 
     json_dir = os.path.join(ann.project_dir, "jsons")
     if not os.path.isdir(json_dir):
-        return
+        return False
 
     # Step 1: 扫描 JSON，收集每个 name 的 group_id 集合 + 最后标注帧号
     #         同时记录 group_id=None 的 name（旧版 JSON 兼���）
@@ -1963,8 +2292,7 @@ def _reconcile_session_group_ids():
                             shape["group_id"] = none_gid_assigned[name]
                             modified = True
                 if modified:
-                    with open(fpath, "w", encoding="utf-8") as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    atomic_json_dump(data, fpath, ensure_ascii=False, indent=2)
                     fixed_count += 1
             except Exception:
                 continue
@@ -2016,7 +2344,7 @@ def _reconcile_session_group_ids():
     if not remap and not missing and not dedup_moves and fixed_count == 0 and pkl_fixed_count == 0:
         if not errors:
             _show_progress("Reconcile: group_ids already consistent.", 100)
-        return
+        return False
 
     # Step 3: 先执行 remap
     if remap:
@@ -2073,8 +2401,8 @@ def _reconcile_session_group_ids():
             ann.curr_img_idx = frame_in_block
 
     # 保存修正后的 pkl（先备份现有 pkl 到带时间戳的 .bak，保留历史）
-    session_name = ann.session_name or "session"
-    pkl_path = os.path.join(ann.project_dir, f"{session_name}.pkl")
+    pkl_path = _session_save_path()
+    session_name = os.path.splitext(os.path.basename(pkl_path))[0]
     bak_name = None
     if os.path.exists(pkl_path):
         import shutil as _shutil
@@ -2087,8 +2415,7 @@ def _reconcile_session_group_ids():
             print(f"[reconcile] backup failed: {e}")
             bak_name = None
     data = ann.compress_to_dict()
-    with open(pkl_path, "wb") as f:
-        pickle.dump(data, f)
+    _save_session_pickle(pkl_path, data)
 
     parts = []
     if dedup_moves:
@@ -2103,18 +2430,27 @@ def _reconcile_session_group_ids():
         parts.append(f"added {len(added)} label(s): {', '.join(added)}")
     suffix = f" (backup: {bak_name})" if bak_name else ""
     _show_progress(f"Reconcile done: {'; '.join(parts)}. Session saved{suffix}.", 100)
+    return True
 
 
 def _load_session_from_path(path):
     """Load a session pkl file. Used by both Load Session and Load Folder (when pkl found)."""
     def do_load():
-        global _max_frame, _session_load_done
+        global _max_frame, _session_load_done, _loaded_session_path
         import shutil as _shutil
 
         _show_progress("Loading session...", 10)
-        with open(path, "rb") as f:
-            data = pickle.load(f)
+        try:
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+        except Exception as e:
+            data = _dict_from_session_state_json(path)
+            if data is None:
+                _show_progress(f"Failed to load session: {e}", 0)
+                return
+            _show_progress("Recovered session from sidecar JSON.", 20)
         ann.load_from_dict(data)
+        _loaded_session_path = path
 
         _show_progress("Restoring frames...", 30)
         temp_img_idx = ann.curr_img_idx
@@ -2588,6 +2924,8 @@ def _show_modal(tag):
     if dpg.does_item_exist(tag):
         _refresh_reassign_combos()
         _refresh_delete_range_combo()
+        if tag == "reconcile_modal" and dpg.does_item_exist("reconcile_block_size"):
+            dpg.set_value("reconcile_block_size", ann.block_size or 200)
         dpg.configure_item(tag, show=True)
 
 
@@ -2624,21 +2962,38 @@ def _cb_reconcile_apply(sender, app_data):
         global _session_load_done, _max_frame
         import shutil as _shutil
 
-        # 应用新的 block_size
-        ann.block_size = new_block_size
+        old_block_size = ann.block_size
         frames_dir = ann.frames_dir
         if os.path.isdir(frames_dir):
             total = len([f for f in os.listdir(frames_dir) if f.endswith(".jpg")])
         else:
             total = _max_frame if _max_frame > 0 else 0
-        if total > 0:
-            ann.num_blocks = max(1, math.ceil(total / new_block_size))
 
-        _reconcile_session_group_ids()
+        block_size_changed = _remap_block_indexed_state(old_block_size, new_block_size, total)
+        if not block_size_changed:
+            ann.block_size = new_block_size
+            if total > 0:
+                ann.num_blocks = max(1, math.ceil(total / new_block_size))
+            if ann.current_block >= ann.num_blocks:
+                ann.current_block = max(0, ann.num_blocks - 1)
+            ann.sam_handler.current_block = ann.current_block
+
+        reconcile_saved = _reconcile_session_group_ids()
+
+        pkl_path = _session_save_path()
+        if block_size_changed and not reconcile_saved:
+            os.makedirs(os.path.dirname(pkl_path), exist_ok=True)
+            bak_name = None
+            if os.path.exists(pkl_path):
+                from datetime import datetime as _dt
+                base_name = os.path.splitext(os.path.basename(pkl_path))[0]
+                bak_name = f"{base_name}.pkl.bak.{_dt.now().strftime('%Y%m%d-%H%M%S')}"
+                _shutil.copy2(pkl_path, os.path.join(os.path.dirname(pkl_path), bak_name))
+            _save_session_pickle(pkl_path, ann.compress_to_dict())
+            suffix = f" (backup: {bak_name})" if bak_name else ""
+            _show_progress(f"Reconcile done: block_size {old_block_size} -> {new_block_size}. Session saved{suffix}.", 100)
 
         # 重新加载刚保存的 pkl，确保帧、block 位置都正确
-        session_name = ann.session_name or "session"
-        pkl_path = os.path.join(ann.project_dir, f"{session_name}.pkl")
         if not os.path.exists(pkl_path):
             _session_load_done = True
             return
@@ -2647,12 +3002,11 @@ def _cb_reconcile_apply(sender, app_data):
             data = pickle.load(f)
         ann.load_from_dict(data)
 
-        # 覆盖 pkl 里的 block_size（用户可能修改了）
-        ann.block_size = new_block_size
         if total > 0:
             ann.num_blocks = max(1, math.ceil(total / new_block_size))
         if ann.current_block >= ann.num_blocks:
             ann.current_block = max(0, ann.num_blocks - 1)
+        ann.sam_handler.current_block = ann.current_block
 
         # 加载对应 block 的帧
         block_size = ann.block_size

@@ -2,12 +2,14 @@
 
 ## [Unreleased]
 ### Added
+- **Crash-safe session persistence**: session `.pkl` saves and LabelMe JSON writes now use same-directory temp files followed by atomic replace. Session saves also write a `.session_state.json` sidecar with label metadata, prompt points/boxes, propagation frames, cursor position, block size, media path, and extra-frame path so a damaged pickle can be rebuilt from recent annotation state.
 - **Overlay mask alpha 滑块**：左侧 View 折叠面板下方新增 `Mask alpha` 滑块（0.0~1.0，默认 0.5），实时调整 overlay 视图中 mask 的浓度。alpha 值写入 session.pkl（`compress_to_dict` / `load_from_dict` 加 `mask_alpha` 字段，旧 pkl 无此字段时 fallback 0.5），重开项目记得上次的浓度。混合方式仍为加法叠加（`cv2.addWeighted(img, 1, mask, alpha, 0)`），不改观感。`create_overlay_img` 内新增 per-frame `_overlay_blend_cache`，缓存当前帧的 `img_rgb` 和 `combined` mask，拖动滑块时只重做混合那一步（跳过 `cv2.imread` 和 `cv2.fillPoly`），实时响应不卡顿；缓存在切帧时按 abs_idx 自动失效，并在 `apply_masks` / `reset` / `clear_label_mask_on_frame` 等 mask 变更点显式失效
 - **自动单帧推理**：添加 prompt（点 / 框）后自动触发 Single 推理，无需手动点 Single 按钮。带 ~120ms 去抖，连点多个点不会重复触发；推理正忙时排队等空闲后再跑；自动触发的推理失败/忙状态不再弹"Inference busy"。手动点 Single 行为保持不变
 - **删光 prompt 自动清 mask**：在当前帧通过 `Z`（撤回）或 `Delete`（删选中）把当前 label 在该帧的最后一个 point/box 删掉时，自动同步清掉该 label 在该帧之前自动生成的 mask（内存 + JSON 同步；JSON 内 shapes 清空后整个 JSON 文件一并删除，时间线蓝色标记消失），画面立即刷新与 prompts 一致。`annotator.py` 新增 `clear_label_mask_on_frame(abs_idx, group_id)` 工具方法
 - **W/S 切换 label 时弹窗显示当前 label**：画面顶部居中显示一个带 label 颜色色条 + 索引徽章的 pill toast（1.2s 自动消失），切 label 时不用再低头看左侧 Labels 列表就能确认当前选中的是哪个
 
 ### Fixed
+- **Reconcile Labels block-size changes**: Reconcile now saves back to the currently loaded `.pkl` path, remaps block-indexed prompts/masks/propagation state when `block_size` changes, preserves the absolute current frame, reloads the same file after saving, and still keeps the existing group-id reconciliation behavior.
 - 2026-05-26: Fixed prompt points/boxes being visible in both Original (1) and Prompts (2) view modes. Original view now keeps the frame clean while Prompts view remains the only mode that draws prompt overlays.
 - **快速切帧导致 mask 错位写盘**：修复推理过程中（或自动单帧推理的 120ms 防抖窗口内）用户切帧/切 block 时，结果会被写到错误绝对帧号 JSON 的偶发竞态。该 bug 表现为"某些帧上突然出现不属于附近帧的 mask、关掉项目重开仍在"。
   - `annotator.py` `generate_mask` 函数入口一次性快照 `curr_img_idx` 和 `current_block` 为本地变量，后续读取全部走快照，避免 719/722 两行先后读出不同值。

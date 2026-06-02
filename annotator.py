@@ -13,6 +13,7 @@ from skimage.measure import label, regionprops
 from skimage.morphology import skeletonize
 from scipy import ndimage as ndi
 import gc
+from safe_io import atomic_json_dump
 class Annotator:
     def __init__(self):
         self.base_checkpoint_path = "./checkpoints/"
@@ -408,8 +409,7 @@ class Annotator:
                               f"(type={type(shape_gid).__name__}) != src {src_group_id} "
                               f"(type={type(src_group_id).__name__})")
                 if changed:
-                    with open(json_path, 'w', encoding='utf-8') as f:
-                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    atomic_json_dump(data, json_path, ensure_ascii=False, indent=2)
                     modified_frames.add(abs_idx)
 
             print(f"[reassign] json: found {n_json_files} json files in range, matched {len(modified_frames)} frames")
@@ -506,8 +506,7 @@ class Annotator:
                     if len(data["shapes"]) == 0:
                         os.remove(json_path)
                     else:
-                        with open(json_path, 'w', encoding='utf-8') as f:
-                            json.dump(data, f, ensure_ascii=False, indent=2)
+                        atomic_json_dump(data, json_path, ensure_ascii=False, indent=2)
                     n_modified += 1
 
         # 2. Remove in-memory masks
@@ -585,8 +584,7 @@ class Annotator:
                 if len(data["shapes"]) != old_n:
                     changed = True
                     if data["shapes"]:
-                        with open(json_path, "w", encoding="utf-8") as f:
-                            json.dump(data, f, ensure_ascii=False, indent=2)
+                        atomic_json_dump(data, json_path, ensure_ascii=False, indent=2)
                     else:
                         # no shapes left → drop the file
                         os.remove(json_path)
@@ -855,8 +853,7 @@ class Annotator:
                 "shape_type": "polygon",
                 "flags": {}
             })
-        with open(json_path, 'w', encoding='utf-8') as f:
-            _json.dump(data, f, ensure_ascii=False, indent=2)
+        atomic_json_dump(data, json_path, ensure_ascii=False, indent=2)
 
     # AUTO-PROMPTING ~ DONE
     
@@ -985,8 +982,7 @@ class Annotator:
                 "imageWidth": int(img_w)
             }
             out_path = os.path.join(export_dir, f"{abs_idx:06d}.json")
-            with open(out_path, 'w', encoding='utf-8') as f:
-                json.dump(labelme_json, f, ensure_ascii=False, indent=2)
+            atomic_json_dump(labelme_json, out_path, ensure_ascii=False, indent=2)
             if step % 50 == 0 or step == total_steps - 1:
                 update_progress_callback("json", step, total_steps)
     # export_video: removed (dead code, was not called by export_all)
