@@ -57,6 +57,9 @@ _main_thread_id = threading.get_ident()
 _pending_progress = []            # queued (msg, pct) updates from worker threads
 _pending_session_name = None      # str or None
 _pending_busy_update = False
+_pending_overlap_results = None
+_overlap_scan_running = False
+_overlap_scan_results = []
 
 LABEL_PRESETS_FILE = "label_presets.json"
 
@@ -431,6 +434,8 @@ def draw_overlays():
     except Exception:
         pass
 
+    _draw_overlap_hover_hint()
+
     # only draw prompt points/boxes in prompts view mode
     if ann.view_mode != "prompts":
         return
@@ -677,6 +682,49 @@ def _is_mouse_over_canvas():
         return False
 
 
+def _draw_overlap_hover_hint():
+    if ann.view_mode not in ("overlay", "masks"):
+        return
+    if ann.curr_img_idx < 0 or not ann.media_files:
+        return
+    if not _is_mouse_over_canvas():
+        return
+    lx, ly = _get_local_mouse_in_drawlist()
+    if not is_in_image(lx, ly):
+        return
+    ix, iy = display_to_img(lx, ly)
+    labels = ann.get_overlap_labels_at(ann._current_abs_idx(), ix, iy)
+    if len(labels) < 2:
+        return
+
+    max_label_len = 26
+    display_labels = [
+        (label if len(label) <= max_label_len else label[:max_label_len - 1] + "...")
+        for label in labels
+    ]
+    lines = ["Overlap masks:"] + display_labels
+    text_w = max(120, min(430, max(len(line) for line in lines) * 9 + 20))
+    line_h = 18
+    box_h = 14 + line_h * len(lines)
+    x1 = min(max(lx + 14, 4), tex_w - text_w - 4)
+    y1 = min(max(ly + 14, 4), tex_h - box_h - 4)
+    x2 = x1 + text_w
+    y2 = y1 + box_h
+
+    dpg.draw_rectangle((x1, y1), (x2, y2),
+                       color=(255, 255, 255, 180),
+                       fill=(0, 0, 0, 205),
+                       rounding=4,
+                       parent=OVERLAY_NODE)
+    for i, line in enumerate(lines):
+        color = (245, 245, 245, 255) if i == 0 else (210, 235, 255, 255)
+        dpg.draw_text((x1 + 10, y1 + 7 + i * line_h),
+                      line,
+                      color=color,
+                      size=14 if i == 0 else 13,
+                      parent=OVERLAY_NODE)
+
+
 def cb_mouse_click(sender, app_data):
     """Left click = foreground point (pt_type=1)."""
     if ann.curr_img_idx < 0:
@@ -693,10 +741,7 @@ def cb_mouse_click(sender, app_data):
     ix = max(0, min(ix, img_orig_w - 1))
     iy = max(0, min(iy, img_orig_h - 1))
     ann.add_point_prompt_to_current_label(ix, iy, 1, ann.curr_img_idx)
-    draw_overlays()
-    update_prompt_list()
-    _autosave_session_state_json()
-    schedule_auto_single()
+    _post_prompt_edit()
 
 
 def _draw_temp_box():
@@ -715,12 +760,10 @@ def _draw_temp_box():
                 ix = max(0, min(ix, img_orig_w - 1))
                 iy = max(0, min(iy, img_orig_h - 1))
                 ann.add_point_prompt_to_current_label(ix, iy, 0, ann.curr_img_idx)  # 0 = background
-                draw_overlays()
-                update_prompt_list()
-                _autosave_session_state_json()
-                schedule_auto_single()
             drag_start = None
             _right_click_start = None
+            if ann.curr_img_idx >= 0 and ann.curr_label_idx >= 0:
+                _post_prompt_edit()
         return
     # button still held — check if moved enough to start drag
     if not dragging and _right_click_start is not None:
@@ -774,17 +817,18 @@ def _finish_drag():
     ix = max(0, min(ix, img_orig_w - 1))
     iy = max(0, min(iy, img_orig_h - 1))
     fx, fy = drag_start
-    if abs(ix - fx) > 5 and abs(iy - fy) > 5:
+    did_add_box = abs(ix - fx) > 5 and abs(iy - fy) > 5
+    if did_add_box:
         x1, x2 = min(fx, ix), max(fx, ix)
         y1, y2 = min(fy, iy), max(fy, iy)
         ann.add_box_prompt_to_current_label(x1, y1, x2, y2, 1, ann.curr_img_idx)
-        _autosave_session_state_json()
     dragging = False
     drag_start = None
     _right_click_start = None
-    draw_overlays()
-    update_prompt_list()
-    schedule_auto_single()
+    if did_add_box:
+        _post_prompt_edit()
+    else:
+        draw_overlays()
 
 
 # ── SAM2 inference (Step 4) ──────────────────────────────────────────────────
@@ -1287,7 +1331,7 @@ def cb_jump_next_prompt():
 def _is_input_focused():
     for tag in ("label_name_input", "block_size_input", "session_name_input",
                  "preextract_path_input", "reassign_start", "reassign_end",
-                 "goto_frame_input"):
+                 "goto_frame_input", "overlap_start", "overlap_end"):
         if dpg.does_item_exist(tag) and dpg.is_item_focused(tag):
             return True
     return False
@@ -1359,14 +1403,11 @@ def cb_goto_frame_dialog():
     dpg.focus_item("goto_frame_input")
 
 
-def _cb_goto_frame_apply(sender=None, app_data=None):
-    """Jump to the absolute frame entered in the goto dialog."""
-    target = dpg.get_value("goto_frame_input")
-    _hide_modal("goto_frame_modal")
-    dpg.focus_item("primary_window")
-    if target < 0 or target >= _max_frame:
-        _show_progress(f"Frame {target} out of range (0-{_max_frame - 1}).", 0)
-        return
+def _jump_to_abs_frame(target, view_mode=None):
+    if target < 0 or (_max_frame > 0 and target >= _max_frame):
+        max_msg = _max_frame - 1 if _max_frame > 0 else "unknown"
+        _show_progress(f"Frame {target} out of range (0-{max_msg}).", 0)
+        return False
     target_block = target // ann.block_size
     target_local = target % ann.block_size
     if target_block != ann.current_block:
@@ -1376,7 +1417,19 @@ def _cb_goto_frame_apply(sender=None, app_data=None):
     if 0 <= target_local < len(ann.media_files):
         _cancel_auto_single_timer()
         ann.set_img(target_local)
+        if view_mode is not None:
+            ann.view_mode = view_mode
         load_and_show_frame()
+        return True
+    return False
+
+
+def _cb_goto_frame_apply(sender=None, app_data=None):
+    """Jump to the absolute frame entered in the goto dialog."""
+    target = dpg.get_value("goto_frame_input")
+    _hide_modal("goto_frame_modal")
+    dpg.focus_item("primary_window")
+    _jump_to_abs_frame(target)
 
 
 def cb_prev_frame():
@@ -1408,10 +1461,7 @@ def cb_clear_prompts():
     # drop in-memory masks for this frame so overlay/masks views refresh immediately
     if abs_idx in ann.masks:
         del ann.masks[abs_idx]
-    if abs_idx in ann.overlay_imgs:
-        del ann.overlay_imgs[abs_idx]
-    if abs_idx in ann.combined_masks:
-        del ann.combined_masks[abs_idx]
+    ann.invalidate_frame_render_cache(abs_idx)
     # also clear prop_frames for this frame
     for label in ann.sam_handler.labels:
         pf = label.prop_frames.get(block, set())
@@ -1425,11 +1475,17 @@ def _post_prompt_edit():
     schedule auto-inference, or — if the current label has no prompts left
     on this frame — wipe its previously-auto-generated mask so the screen
     matches what the user sees."""
-    draw_overlays()
-    update_prompt_list()
-    _autosave_session_state_json()
     if ann.curr_label_idx < 0 or ann.curr_img_idx < 0:
         return
+    abs_idx = ann._abs_idx(ann.curr_img_idx) if hasattr(ann, "_abs_idx") else (
+        ann.current_block * ann.block_size + ann.curr_img_idx)
+    ann.invalidate_frame_render_cache(abs_idx)
+    if ann.view_mode in ("overlay", "masks"):
+        load_and_show_frame()
+    else:
+        draw_overlays()
+    update_prompt_list()
+    _autosave_session_state_json()
     label = ann.sam_handler.labels[ann.curr_label_idx]
     block = ann.current_block
     frame = ann.curr_img_idx
@@ -1439,8 +1495,6 @@ def _post_prompt_edit():
         schedule_auto_single()
         return
     # no prompts left for this label on this frame → drop its mask
-    abs_idx = ann._abs_idx(frame) if hasattr(ann, "_abs_idx") else (
-        ann.current_block * ann.block_size + frame)
     if ann.clear_label_mask_on_frame(abs_idx, label.group_id):
         load_and_show_frame()
 
@@ -2919,6 +2973,169 @@ def _refresh_delete_range_combo():
 
 # ── modal dialogs ────────────────────────────────────────────────────────────
 
+def _overlap_scan_default_bounds():
+    idxs = set()
+    json_dir = os.path.join(ann.project_dir, "jsons")
+    if os.path.isdir(json_dir):
+        for fname in os.listdir(json_dir):
+            if not fname.endswith(".json"):
+                continue
+            try:
+                idxs.add(int(os.path.splitext(fname)[0]))
+            except ValueError:
+                pass
+    for key in ann.masks.keys():
+        try:
+            idxs.add(int(key))
+        except (TypeError, ValueError):
+            pass
+    if _max_frame > 0:
+        return 0, max(0, _max_frame - 1)
+    if idxs:
+        return min(idxs), max(idxs)
+    cur_abs = ann._current_abs_idx() if ann.media_files else 0
+    return cur_abs, cur_abs
+
+
+def _prepare_overlap_scan_modal():
+    if not dpg.does_item_exist("overlap_start"):
+        return
+    start_abs, end_abs = _overlap_scan_default_bounds()
+    dpg.set_value("overlap_start", int(start_abs))
+    dpg.set_value("overlap_end", int(end_abs))
+    _render_overlap_scan_results(None)
+
+
+def cb_overlap_scan_dialog(sender=None, app_data=None):
+    _show_modal("overlap_scan_modal")
+
+
+def _format_overlap_result_item(result):
+    labels = " + ".join(result.get("labels", []))
+    frame = int(result.get("frame", 0))
+    pixels = int(result.get("overlap_pixels", 0))
+    regions = len(result.get("components", []))
+    return f"{frame:06d} | {pixels} px | {regions} region(s) | {labels}"
+
+
+def _render_overlap_scan_results(payload):
+    global _overlap_scan_results, _overlap_scan_running
+    if not dpg.does_item_exist("overlap_results_container"):
+        return
+    dpg.delete_item("overlap_results_container", children_only=True)
+    if payload is None:
+        _overlap_scan_results = []
+        dpg.add_text("Run a scan to list frames with overlapping masks.",
+                     color=(160, 160, 160), parent="overlap_results_container",
+                     wrap=520)
+        return
+
+    _overlap_scan_running = False
+    if payload.get("error"):
+        _overlap_scan_results = []
+        dpg.add_text(payload["error"], color=(255, 90, 90),
+                     parent="overlap_results_container", wrap=520)
+        _show_progress(payload["error"], 0)
+        return
+
+    results = payload.get("results", [])
+    _overlap_scan_results = results
+    start_abs = payload.get("start_abs")
+    end_abs = payload.get("end_abs")
+    if not results:
+        dpg.add_text(f"No overlaps found in [{start_abs}, {end_abs}].",
+                     color=(180, 220, 180), parent="overlap_results_container",
+                     wrap=520)
+        _show_progress(f"No overlaps found in [{start_abs}, {end_abs}].", 100)
+        return
+
+    total_pixels = sum(int(r.get("overlap_pixels", 0)) for r in results)
+    dpg.add_text(
+        f"{len(results)} frame(s) with overlaps in [{start_abs}, {end_abs}], "
+        f"{total_pixels} overlap pixels total.",
+        color=(230, 230, 230),
+        parent="overlap_results_container",
+        wrap=520,
+    )
+    for result in results:
+        dpg.add_selectable(
+            label=_format_overlap_result_item(result),
+            parent="overlap_results_container",
+            callback=_cb_overlap_result_selected,
+            user_data=int(result["frame"]),
+        )
+    _show_progress(f"Overlap scan found {len(results)} frame(s).", 100)
+
+
+def _start_overlap_scan(start_abs, end_abs):
+    global _overlap_scan_running
+    if _overlap_scan_running:
+        _show_progress("Overlap scan already running.", 0)
+        return
+    if start_abs > end_abs:
+        _show_progress("Start frame must be <= end frame.", 0)
+        return
+
+    _overlap_scan_running = True
+    if dpg.does_item_exist("overlap_results_container"):
+        dpg.delete_item("overlap_results_container", children_only=True)
+        dpg.add_text("Scanning overlaps...",
+                     color=(180, 180, 180),
+                     parent="overlap_results_container")
+    _show_progress(f"Scanning overlaps [{start_abs}, {end_abs}]...", 0)
+
+    def task():
+        global _pending_overlap_results
+        try:
+            def progress(done, total):
+                pct = int(done / max(1, total) * 100)
+                _show_progress(f"Scanning overlaps: {done}/{total}", pct)
+
+            results = ann.scan_mask_overlaps(
+                start_abs=start_abs,
+                end_abs=end_abs,
+                progress_callback=progress,
+            )
+            _pending_overlap_results = {
+                "start_abs": int(start_abs),
+                "end_abs": int(end_abs),
+                "results": results,
+            }
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            _pending_overlap_results = {
+                "start_abs": int(start_abs),
+                "end_abs": int(end_abs),
+                "error": f"Overlap scan failed: {e}",
+            }
+
+    threading.Thread(target=task, daemon=True).start()
+
+
+def _cb_overlap_scan_range(sender=None, app_data=None):
+    start_abs = int(dpg.get_value("overlap_start"))
+    end_abs = int(dpg.get_value("overlap_end"))
+    _start_overlap_scan(start_abs, end_abs)
+
+
+def _cb_overlap_scan_all(sender=None, app_data=None):
+    start_abs, end_abs = _overlap_scan_default_bounds()
+    if dpg.does_item_exist("overlap_start"):
+        dpg.set_value("overlap_start", int(start_abs))
+    if dpg.does_item_exist("overlap_end"):
+        dpg.set_value("overlap_end", int(end_abs))
+    _start_overlap_scan(start_abs, end_abs)
+
+
+def _cb_overlap_result_selected(sender, app_data, user_data):
+    frame = int(user_data)
+    _hide_modal("overlap_scan_modal")
+    ann.view_mode = "overlay"
+    if _jump_to_abs_frame(frame, view_mode="overlay"):
+        _show_progress(f"Jumped to overlap frame {frame}.", 100)
+
+
 def _show_modal(tag):
     """Show a modal dialog window."""
     if dpg.does_item_exist(tag):
@@ -2926,6 +3143,8 @@ def _show_modal(tag):
         _refresh_delete_range_combo()
         if tag == "reconcile_modal" and dpg.does_item_exist("reconcile_block_size"):
             dpg.set_value("reconcile_block_size", ann.block_size or 200)
+        if tag == "overlap_scan_modal":
+            _prepare_overlap_scan_modal()
         dpg.configure_item(tag, show=True)
 
 
@@ -3066,6 +3285,28 @@ def _build_modal_dialogs():
         with dpg.group(horizontal=True):
             dpg.add_button(label="Go", callback=_cb_goto_frame_apply, width=100)
             dpg.add_button(label="Cancel", callback=lambda: (_hide_modal("goto_frame_modal"), dpg.focus_item("primary_window")), width=100)
+
+    # Overlap scan dialog
+    with dpg.window(label="Check Mask Overlaps", tag="overlap_scan_modal",
+                    modal=True, show=False, width=620, height=430, no_resize=True):
+        dpg.add_text("Scan existing JSON and in-memory masks for different labels covering the same pixels.",
+                     wrap=590)
+        with dpg.group(horizontal=True):
+            dpg.add_text("Frames:")
+            dpg.add_input_int(tag="overlap_start", default_value=0, width=110,
+                              min_value=0, min_clamped=True)
+            dpg.add_text("-")
+            dpg.add_input_int(tag="overlap_end", default_value=0, width=110,
+                              min_value=0, min_clamped=True)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Scan Range", callback=_cb_overlap_scan_range, width=120)
+            dpg.add_button(label="Whole Video", callback=_cb_overlap_scan_all, width=120)
+            dpg.add_button(label="Close", callback=lambda: _hide_modal("overlap_scan_modal"), width=100)
+        dpg.add_separator()
+        with dpg.child_window(tag="overlap_results_container",
+                              width=-1, height=285, border=True):
+            dpg.add_text("Run a scan to list frames with overlapping masks.",
+                         color=(160, 160, 160), wrap=560)
 
     # Reassign label dialog
     with dpg.window(label="Reassign Label", tag="reassign_modal",
@@ -3283,6 +3524,8 @@ def build_ui():
                                          tag="mask_alpha_slider",
                                          default_value=0.5, min_value=0.0, max_value=1.0,
                                          width=-80, callback=cb_set_mask_alpha)
+                    dpg.add_button(label="Check Overlaps",
+                                   callback=cb_overlap_scan_dialog, width=-1)
 
                 # ── Export ──
                 with dpg.collapsing_header(label="Export", default_open=False):
@@ -3327,6 +3570,7 @@ def build_ui():
     while dpg.is_dearpygui_running():
         global _session_load_done, _media_load_done
         global _pending_progress, _pending_session_name, _pending_busy_update
+        global _pending_overlap_results
         # flush thread-safe UI updates
         if _pending_busy_update:
             _pending_busy_update = False
@@ -3340,6 +3584,13 @@ def build_ui():
                 dpg.set_value("progress_text", pp[0])
             except Exception:
                 pass
+        if _pending_overlap_results is not None:
+            por = _pending_overlap_results
+            _pending_overlap_results = None
+            try:
+                _render_overlap_scan_results(por)
+            except Exception as e:
+                print(f"overlap results render error: {e}")
         psn = _pending_session_name
         if psn is not None:
             _pending_session_name = None
@@ -3362,6 +3613,8 @@ def build_ui():
             load_and_show_frame()
             _show_progress(f"Session loaded: {ann.session_name} "
                            f"({len(ann.media_files)} frames)", 100)
+        if ann.view_mode in ("overlay", "masks"):
+            draw_overlays()
         _draw_temp_box()
         dpg.render_dearpygui_frame()
 

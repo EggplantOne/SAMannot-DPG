@@ -34,6 +34,7 @@ class Annotator:
         self.cache_images = True
         self.mask_alpha = 0.5  # blending alpha for overlay view (cv2.addWeighted)
         self._overlay_blend_cache = None  # per-frame cache of (img_rgb, combined, mask_bin) for fast alpha drag
+        self._overlap_lookup_cache = None
         self.current_img_width = 0
         self.current_img_height = 0
 
@@ -72,6 +73,7 @@ class Annotator:
         self.overlay_imgs = {}
         self.combined_masks = {}
         self._overlay_blend_cache = None
+        self._overlap_lookup_cache = None
         self.masks = {}
         self.tracking_results = {}
         self.label_handler = Label_Handler()
@@ -569,9 +571,7 @@ class Annotator:
             if not self.masks[abs_idx]:
                 del self.masks[abs_idx]
             changed = True
-        # invalidate per-frame overlay blend cache so the next render rebuilds it
-        if self._overlay_blend_cache is not None and self._overlay_blend_cache.get("abs_idx") == abs_idx:
-            self._overlay_blend_cache = None
+        self.invalidate_frame_render_cache(abs_idx)
         # 2. JSON file on disk
         json_path = os.path.join(self.project_dir, "jsons", f"{abs_idx:06d}.json")
         if os.path.exists(json_path):
@@ -594,8 +594,7 @@ class Annotator:
                 print(f"clear_label_mask_on_frame JSON error: {e}")
         # 3. invalidate render caches for this frame
         if changed:
-            self.overlay_imgs.pop(abs_idx, None)
-            self.combined_masks.pop(abs_idx, None)
+            self.invalidate_frame_render_cache(abs_idx)
         return changed
     
     # MODEL HANDLING
@@ -698,9 +697,7 @@ class Annotator:
         if merge and n_added > 0:
             # Merge mode: JSONs already written, just update state
             self._json_frames = getattr(self, '_json_frames', set()) | merged_idxs
-            self.overlay_imgs = {}
-            self.combined_masks = {}
-            self._overlay_blend_cache = None
+            self.invalidate_frame_render_cache()
             self.mode = "correction"
             self.view_mode = "overlay"
             import gc; gc.collect()
@@ -714,9 +711,7 @@ class Annotator:
             self._json_frames = getattr(self, '_json_frames', set()) | exported_idxs
             # free masks from memory
             self.masks = {}
-            self.overlay_imgs = {}
-            self.combined_masks = {}
-            self._overlay_blend_cache = None
+            self.invalidate_frame_render_cache()
             self.mode = "correction"
             self.view_mode = "overlay"
             import gc; gc.collect()
@@ -1010,32 +1005,31 @@ class Annotator:
         img = cv2.imread(frame_path)
         if img is None:
             return None
+        shapes = frame_json.get("shapes", [])
+        mask_overlay_rgb, overlap_mask, covered_mask = self._combined_mask_data(
+            abs_idx,
+            apply_overlap_cue=False,
+            shapes=shapes,
+            shape_hw=img.shape[:2],
+        )
         overlay = img.copy()
+        if mask_overlay_rgb is not None:
+            mask_overlay_bgr = cv2.cvtColor(mask_overlay_rgb, cv2.COLOR_RGB2BGR)
+            overlay[covered_mask] = mask_overlay_bgr[covered_mask]
         shape_labels = []  # [(pts, label_name, rgb_tuple)]
-        for shape in frame_json.get("shapes", []):
+        for shape in shapes:
             label_name = shape.get("label", "")
             gid = shape.get("group_id", None)
             points = shape.get("points", [])
             if not points:
                 continue
-            hex_col = "#ffffff"
-            if gid is not None:
-                for lbl in self.sam_handler.labels:
-                    if lbl.group_id == gid:
-                        hex_col = lbl.col
-                        break
-            else:
-                for lbl in self.sam_handler.labels:
-                    if lbl.name == label_name:
-                        hex_col = lbl.col
-                        break
-            r, g, b = self.hex_to_rgb(hex_col)
+            label_name, (r, g, b) = self._label_meta_for_mask(label_name, gid)
             colour = (b, g, r)
             pts = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
-            cv2.fillPoly(overlay, [pts], colour)
             cv2.polylines(overlay, [pts], isClosed=True, color=colour, thickness=2)
             shape_labels.append((pts, label_name, (r, g, b)))
         blended = cv2.addWeighted(img, 0.55, overlay, 0.45, 0)
+        blended = self._apply_overlap_cue(blended, overlap_mask)
         # label name near the largest polygon of each label (one text per label)
         best = {}  # label_name -> (area, x, y, bw, bh, rgb)
         for pts, label_name, rgb in shape_labels:
@@ -1251,6 +1245,8 @@ class Annotator:
         self.original_img = None
         self.overlay_imgs = {}
         self.combined_masks = {}
+        self._overlay_blend_cache = None
+        self._overlap_lookup_cache = None
         self.mode = "prompts"
         self.view_mode = "prompts"
         self.tracking_results = {}
@@ -1465,6 +1461,409 @@ class Annotator:
         except Exception:
             return None
 
+    def invalidate_frame_render_cache(self, abs_idx=None):
+        if abs_idx is None:
+            self._overlay_blend_cache = None
+            self._overlap_lookup_cache = None
+            self.overlay_imgs = {}
+            self.combined_masks = {}
+            return
+        if (self._overlay_blend_cache is not None and
+                self._overlay_blend_cache.get("abs_idx") == abs_idx):
+            self._overlay_blend_cache = None
+        if (self._overlap_lookup_cache is not None and
+                self._overlap_lookup_cache.get("abs_idx") == abs_idx):
+            self._overlap_lookup_cache = None
+        self.overlay_imgs.pop(abs_idx, None)
+        self.combined_masks.pop(abs_idx, None)
+
+    def _normalise_group_id(self, group_id):
+        if group_id is None:
+            return None
+        try:
+            return int(group_id)
+        except (TypeError, ValueError):
+            return str(group_id)
+
+    def _mask_identity_key(self, group_id, label_name):
+        group_key = self._normalise_group_id(group_id)
+        if group_key is not None:
+            return ("group_id", group_key)
+        return ("label", label_name or "")
+
+    def _label_meta_for_mask(self, label_name="", group_id=None):
+        display_name = label_name or ""
+        group_key = self._normalise_group_id(group_id)
+        if group_key is not None:
+            for lbl in self.sam_handler.labels:
+                if self._normalise_group_id(getattr(lbl, "group_id", None)) == group_key:
+                    return lbl.name, self.hex_to_rgb(lbl.col)
+
+        if display_name:
+            for lbl in self.sam_handler.labels:
+                if lbl.name == display_name:
+                    return display_name, self.hex_to_rgb(lbl.col)
+
+        if not display_name and group_key is not None:
+            display_name = f"label_{group_key}"
+        return display_name, self.hex_to_rgb("#ffffff")
+
+    def _mask_entries_from_memory(self, abs_idx, shape_hw=None):
+        frame_masks = self.masks.get(abs_idx, {})
+        entries = []
+        for group_id, mask in frame_masks.items():
+            mask_arr = np.asarray(mask, dtype=bool)
+            if mask_arr.ndim > 2:
+                mask_arr = np.squeeze(mask_arr).astype(bool)
+            if mask_arr.ndim != 2:
+                continue
+            if shape_hw is not None and mask_arr.shape != shape_hw:
+                continue
+            label_name, color = self._label_meta_for_mask(group_id=group_id)
+            entries.append({
+                "key": self._mask_identity_key(group_id, label_name),
+                "group_id": self._normalise_group_id(group_id),
+                "label": label_name,
+                "color": color,
+                "mask": mask_arr,
+            })
+        return entries
+
+    def _mask_entries_from_shapes(self, shapes, shape_hw):
+        if not shapes or shape_hw is None:
+            return []
+        h, w = shape_hw
+        grouped = {}
+        for shape in shapes:
+            label_name = shape.get("label", "")
+            group_id = shape.get("group_id", None)
+            points = shape.get("points", [])
+            if not points:
+                continue
+            try:
+                pts = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
+            except Exception:
+                continue
+            if len(pts) < 3:
+                continue
+
+            key = self._mask_identity_key(group_id, label_name)
+            if key not in grouped:
+                display_name, color = self._label_meta_for_mask(label_name, group_id)
+                grouped[key] = {
+                    "key": key,
+                    "group_id": self._normalise_group_id(group_id),
+                    "label": display_name,
+                    "color": color,
+                    "mask": np.zeros((h, w), dtype=bool),
+                }
+
+            poly_mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(poly_mask, [pts], 1)
+            grouped[key]["mask"] |= poly_mask.astype(bool)
+
+        return list(grouped.values())
+
+    def _mask_entries_for_abs_idx(self, abs_idx, shape_hw=None, shapes=None):
+        if shapes is not None:
+            return self._mask_entries_from_shapes(shapes, shape_hw)
+        entries_by_key = {}
+        if shape_hw is not None:
+            shapes = self._load_shapes_from_json(abs_idx)
+            for entry in self._mask_entries_from_shapes(shapes, shape_hw):
+                entries_by_key[entry["key"]] = entry
+        for entry in self._mask_entries_from_memory(abs_idx, shape_hw):
+            entries_by_key[entry["key"]] = entry
+        return list(entries_by_key.values())
+
+    def _entry_report_name(self, entry, duplicate_names=None):
+        label_name = entry.get("label") or str(entry.get("key", "label"))
+        if duplicate_names and label_name in duplicate_names:
+            group_id = entry.get("group_id")
+            if group_id is not None:
+                return f"{label_name}#{group_id}"
+        return label_name
+
+    def _overlap_components_from_entries(self, entries, shape_hw, min_area=1):
+        if not entries or shape_hw is None:
+            return [], 0
+        _, overlap_mask, _ = self._compose_mask_entries(
+            entries,
+            shape_hw,
+            apply_overlap_cue=False,
+        )
+        if overlap_mask is None or not np.any(overlap_mask):
+            return [], 0
+
+        overlap_u8 = overlap_mask.astype(np.uint8)
+        n_labels, comp_labels, stats, _ = cv2.connectedComponentsWithStats(
+            overlap_u8,
+            connectivity=8,
+        )
+        name_counts = {}
+        for entry in entries:
+            name = entry.get("label") or ""
+            name_counts[name] = name_counts.get(name, 0) + 1
+        duplicate_names = {name for name, count in name_counts.items() if count > 1}
+
+        components = []
+        for comp_id in range(1, n_labels):
+            area = int(stats[comp_id, cv2.CC_STAT_AREA])
+            if area < min_area:
+                continue
+            comp_mask = comp_labels == comp_id
+            involved = []
+            for entry in entries:
+                if np.any(entry["mask"] & comp_mask):
+                    involved.append(self._entry_report_name(entry, duplicate_names))
+            involved = list(dict.fromkeys(involved))
+            if len(involved) < 2:
+                continue
+            components.append({
+                "area": area,
+                "bbox": (
+                    int(stats[comp_id, cv2.CC_STAT_LEFT]),
+                    int(stats[comp_id, cv2.CC_STAT_TOP]),
+                    int(stats[comp_id, cv2.CC_STAT_WIDTH]),
+                    int(stats[comp_id, cv2.CC_STAT_HEIGHT]),
+                ),
+                "labels": involved,
+            })
+
+        return components, int(overlap_u8.sum())
+
+    def _json_mask_entries_for_scan(self, abs_idx):
+        json_path = os.path.join(self.project_dir, "jsons", f"{abs_idx:06d}.json")
+        if not os.path.exists(json_path):
+            return [], None
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return [], None
+        h = int(data.get("imageHeight") or 0)
+        w = int(data.get("imageWidth") or 0)
+        if h <= 0 or w <= 0:
+            return [], None
+        shape_hw = (h, w)
+        return self._mask_entries_from_shapes(data.get("shapes", []), shape_hw), shape_hw
+
+    def _memory_mask_entries_for_scan(self, abs_idx, shape_hw=None):
+        entries = self._mask_entries_from_memory(abs_idx, shape_hw=shape_hw)
+        if shape_hw is None and entries:
+            shape_hw = entries[0]["mask"].shape
+        return entries, shape_hw
+
+    def _merged_entries_for_overlap_scan(self, abs_idx):
+        json_entries, shape_hw = self._json_mask_entries_for_scan(abs_idx)
+        memory_entries, shape_hw = self._memory_mask_entries_for_scan(abs_idx, shape_hw=shape_hw)
+        by_key = {}
+        for entry in json_entries + memory_entries:
+            key = entry["key"]
+            copied = dict(entry)
+            copied["mask"] = np.array(entry["mask"], dtype=bool, copy=True)
+            by_key[key] = copied
+        if shape_hw is None and by_key:
+            shape_hw = next(iter(by_key.values()))["mask"].shape
+        return list(by_key.values()), shape_hw
+
+    def _overlap_lookup_signature(self, abs_idx):
+        json_path = os.path.join(self.project_dir, "jsons", f"{abs_idx:06d}.json")
+        json_sig = None
+        if os.path.exists(json_path):
+            try:
+                st = os.stat(json_path)
+                json_sig = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                json_sig = None
+        mem_sig = []
+        for group_id, mask in self.masks.get(abs_idx, {}).items():
+            mem_sig.append((group_id, getattr(mask, "shape", None), id(mask)))
+        return (abs_idx, json_sig, tuple(sorted(mem_sig, key=lambda x: str(x[0]))))
+
+    def _build_overlap_lookup(self, abs_idx):
+        entries, shape_hw = self._merged_entries_for_overlap_scan(abs_idx)
+        if not entries or shape_hw is None:
+            return {
+                "abs_idx": abs_idx,
+                "signature": self._overlap_lookup_signature(abs_idx),
+                "shape_hw": shape_hw,
+                "component_map": None,
+                "component_labels": {},
+            }
+
+        _, overlap_mask, _ = self._compose_mask_entries(
+            entries,
+            shape_hw,
+            apply_overlap_cue=False,
+        )
+        if overlap_mask is None or not np.any(overlap_mask):
+            return {
+                "abs_idx": abs_idx,
+                "signature": self._overlap_lookup_signature(abs_idx),
+                "shape_hw": shape_hw,
+                "component_map": None,
+                "component_labels": {},
+            }
+
+        n_labels, comp_map = cv2.connectedComponents(
+            overlap_mask.astype(np.uint8),
+            connectivity=8,
+        )
+        name_counts = {}
+        for entry in entries:
+            name = entry.get("label") or ""
+            name_counts[name] = name_counts.get(name, 0) + 1
+        duplicate_names = {name for name, count in name_counts.items() if count > 1}
+
+        component_labels = {}
+        for comp_id in range(1, n_labels):
+            comp_mask = comp_map == comp_id
+            involved = []
+            for entry in entries:
+                if np.any(entry["mask"] & comp_mask):
+                    involved.append(self._entry_report_name(entry, duplicate_names))
+            involved = list(dict.fromkeys(involved))
+            if len(involved) >= 2:
+                component_labels[comp_id] = involved
+
+        return {
+            "abs_idx": abs_idx,
+            "signature": self._overlap_lookup_signature(abs_idx),
+            "shape_hw": shape_hw,
+            "component_map": comp_map,
+            "component_labels": component_labels,
+        }
+
+    def get_overlap_labels_at(self, abs_idx, x, y):
+        signature = self._overlap_lookup_signature(abs_idx)
+        cache = self._overlap_lookup_cache
+        if cache is None or cache.get("signature") != signature:
+            cache = self._build_overlap_lookup(abs_idx)
+            self._overlap_lookup_cache = cache
+        comp_map = cache.get("component_map")
+        shape_hw = cache.get("shape_hw")
+        if comp_map is None or shape_hw is None:
+            return []
+        ix = int(round(x))
+        iy = int(round(y))
+        h, w = shape_hw
+        if ix < 0 or iy < 0 or ix >= w or iy >= h:
+            return []
+        comp_id = int(comp_map[iy, ix])
+        if comp_id <= 0:
+            return []
+        return cache.get("component_labels", {}).get(comp_id, [])
+
+    def scan_mask_overlaps(self, start_abs=None, end_abs=None, min_area=1, progress_callback=None):
+        """Scan existing annotations for overlapping masks from different labels."""
+        json_dir = os.path.join(self.project_dir, "jsons")
+        candidate_idxs = set()
+        if os.path.isdir(json_dir):
+            for fname in os.listdir(json_dir):
+                if not fname.endswith(".json"):
+                    continue
+                try:
+                    candidate_idxs.add(int(os.path.splitext(fname)[0]))
+                except ValueError:
+                    continue
+        for key in self.masks.keys():
+            try:
+                candidate_idxs.add(int(key))
+            except (TypeError, ValueError):
+                continue
+
+        if start_abs is not None:
+            candidate_idxs = {idx for idx in candidate_idxs if idx >= int(start_abs)}
+        if end_abs is not None:
+            candidate_idxs = {idx for idx in candidate_idxs if idx <= int(end_abs)}
+
+        sorted_idxs = sorted(candidate_idxs)
+        results = []
+        total = len(sorted_idxs)
+        for pos, abs_idx in enumerate(sorted_idxs, start=1):
+            entries, shape_hw = self._merged_entries_for_overlap_scan(abs_idx)
+            components, overlap_pixels = self._overlap_components_from_entries(
+                entries,
+                shape_hw,
+                min_area=min_area,
+            )
+            if components:
+                labels = []
+                for comp in components:
+                    labels.extend(comp["labels"])
+                labels = list(dict.fromkeys(labels))
+                results.append({
+                    "frame": int(abs_idx),
+                    "overlap_pixels": int(overlap_pixels),
+                    "components": components,
+                    "labels": labels,
+                })
+            if progress_callback and (pos % 25 == 0 or pos == total):
+                progress_callback(pos, total)
+        return results
+
+    def _compose_mask_entries(self, entries, shape_hw, apply_overlap_cue=True):
+        if not entries or shape_hw is None:
+            return None, None, None
+        h, w = shape_hw
+        color_sum = np.zeros((h, w, 3), dtype=np.uint16)
+        cover_count = np.zeros((h, w), dtype=np.uint16)
+
+        for entry in entries:
+            mask = entry["mask"]
+            if mask.shape != (h, w):
+                continue
+            color = np.asarray(entry["color"], dtype=np.uint16)
+            color_sum[mask] += color
+            cover_count[mask] += 1
+
+        covered_mask = cover_count > 0
+        if not np.any(covered_mask):
+            return None, None, None
+
+        combined = np.zeros((h, w, 3), dtype=np.uint8)
+        combined[covered_mask] = (
+            color_sum[covered_mask] / cover_count[covered_mask][:, None]
+        ).astype(np.uint8)
+        overlap_mask = cover_count >= 2
+        if apply_overlap_cue:
+            combined = self._apply_overlap_cue(combined, overlap_mask)
+        return combined, overlap_mask, covered_mask
+
+    def _combined_mask_data(self, abs_idx=None, apply_overlap_cue=True, shapes=None, shape_hw=None):
+        if abs_idx is None:
+            abs_idx = self._current_abs_idx()
+
+        if shape_hw is None:
+            h, w = self.curr_img_shape[:2] if len(self.curr_img_shape) >= 2 else (0, 0)
+            shape_hw = (h, w) if h and w else None
+
+        entries = self._mask_entries_for_abs_idx(abs_idx, shape_hw=shape_hw, shapes=shapes)
+        if shape_hw is None and entries:
+            shape_hw = entries[0]["mask"].shape
+        return self._compose_mask_entries(entries, shape_hw, apply_overlap_cue=apply_overlap_cue)
+
+    def _apply_overlap_cue(self, img, overlap_mask):
+        if overlap_mask is None or not np.any(overlap_mask):
+            return img
+        result = img.copy()
+        result[overlap_mask] = np.clip(
+            result[overlap_mask].astype(np.float32) * 0.78 + 255.0 * 0.22,
+            0,
+            255,
+        ).astype(np.uint8)
+
+        contours, _ = cv2.findContours(
+            overlap_mask.astype(np.uint8) * 255,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE,
+        )
+        if contours:
+            cv2.drawContours(result, contours, -1, (20, 20, 20), 3, lineType=cv2.LINE_AA)
+            cv2.drawContours(result, contours, -1, (255, 255, 255), 1, lineType=cv2.LINE_AA)
+        return result
+
     def create_overlay_img(self, abs_idx=None, overwrite=False):
         """渲染 overlay：原图 + 半透明 mask。从 JSON 或内存 masks 渲染。
 
@@ -1484,13 +1883,17 @@ class Annotator:
                 and cache.get("abs_idx") == abs_idx):
             img_rgb = cache["img_rgb"]
             combined = cache["combined"]
+            overlap_mask = cache.get("overlap_mask")
         else:
             file_path = self._path_for_abs_idx(abs_idx)
             if not os.path.exists(file_path):
                 return None
             img_rgb = cv2.cvtColor(cv2.imread(file_path), cv2.COLOR_BGR2RGB)
             self.curr_img_shape = img_rgb.shape
-            combined = self.create_combined_mask(abs_idx, overwrite=overwrite)
+            combined, overlap_mask, _ = self._combined_mask_data(
+                abs_idx,
+                apply_overlap_cue=False,
+            )
             if combined is None:
                 self._overlay_blend_cache = None
                 return None
@@ -1498,47 +1901,17 @@ class Annotator:
                 "abs_idx": abs_idx,
                 "img_rgb": img_rgb,
                 "combined": combined,
+                "overlap_mask": overlap_mask,
             }
         self.curr_img_shape = img_rgb.shape
-        return cv2.addWeighted(img_rgb, 1, combined, alpha, 0)
+        blended = cv2.addWeighted(img_rgb, 1, combined, alpha, 0)
+        return self._apply_overlap_cue(blended, overlap_mask)
 
     def create_combined_mask(self, abs_idx=None, overwrite=False):
         """渲染合成 mask。优先从内存 masks 读，其次从 JSON 读。"""
-        if abs_idx is None:
-            abs_idx = self._current_abs_idx()
+        combined, _, _ = self._combined_mask_data(abs_idx, apply_overlap_cue=True)
+        return combined
 
-        # try memory first (during apply_masks, before export)
-        if abs_idx in self.masks and self.masks[abs_idx]:
-            mask_overlay = np.zeros(self.curr_img_shape, dtype=np.uint8)
-            for group_id, mask in self.masks[abs_idx].items():
-                label_color = self.hex_to_rgb(
-                    next((l.col for l in self.sam_handler.labels if l.group_id == group_id), "#ffffff"))
-                mask_overlay[np.asarray(mask, dtype=bool)] = label_color
-            return mask_overlay
-
-        # read from JSON
-        shapes = self._load_shapes_from_json(abs_idx)
-        if not shapes:
-            return None
-
-        h, w = self.curr_img_shape[:2] if len(self.curr_img_shape) >= 2 else (0, 0)
-        if h == 0:
-            return None
-        mask_overlay = np.zeros((h, w, 3), dtype=np.uint8)
-        for shape in shapes:
-            label_name = shape.get("label", "")
-            gid = shape.get("group_id", None)
-            points = shape.get("points", [])
-            if not points:
-                continue
-            if gid is not None:
-                hex_col = next((l.col for l in self.sam_handler.labels if l.group_id == gid), "#ffffff")
-            else:
-                hex_col = next((l.col for l in self.sam_handler.labels if l.name == label_name), "#ffffff")
-            color = self.hex_to_rgb(hex_col)
-            pts = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
-            cv2.fillPoly(mask_overlay, [pts], color)
-        return mask_overlay
     def get_img_to_resize(self):
         if self.view_mode == "overlay":
             if not hasattr(self, 'masks'):
