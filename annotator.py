@@ -9,11 +9,12 @@ from sam_annotator import SAM_Annotator
 import shutil
 import re
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from skimage.measure import label, regionprops
 from skimage.morphology import skeletonize
 from scipy import ndimage as ndi
 import gc
-from safe_io import atomic_json_dump
+from safe_io import atomic_json_dump, cv_imread, cv_imwrite
 class Annotator:
     def __init__(self):
         self.base_checkpoint_path = "./checkpoints/"
@@ -25,6 +26,7 @@ class Annotator:
         self.idx_to_path = {}
         self.video_name = ""
         self.media_path = "."
+        self._project_dir_override = None
         
         self.overlay_img = None
         self.composite_mask = None
@@ -83,6 +85,7 @@ class Annotator:
         self.session_name = "Session"
         self.video_name = ""
         self.media_path = "."
+        self._project_dir_override = None
         self.tracking_results = {}
         self.sam_handler.labels = []
         self.sam_handler.object_id_to_group_id = {}
@@ -246,14 +249,19 @@ class Annotator:
         return len(self.media_files) > 0
 
     # ===== 项目目录属性 =====
-    # 所有产物统一在 projects/{video_name}/ 下
+    # 默认使用 projects/{video_name}/；加载外部项目时使用其真实目录。
     @property
     def project_dir(self):
+        if self._project_dir_override:
+            return self._project_dir_override
         if self.video_name:
             name = os.path.splitext(os.path.basename(self.video_name))[0]
         else:
             name = self.session_name or "default"
         return os.path.join("projects", name)
+
+    def set_project_dir(self, path):
+        self._project_dir_override = os.path.abspath(path) if path else None
 
     @property
     def frames_dir(self):
@@ -1002,7 +1010,7 @@ class Annotator:
             return None
         with open(json_path, "r", encoding="utf-8") as f:
             frame_json = _json.load(f)
-        img = cv2.imread(frame_path)
+        img = cv_imread(frame_path)
         if img is None:
             return None
         shapes = frame_json.get("shapes", [])
@@ -1080,7 +1088,7 @@ class Annotator:
             if blended is None:
                 continue
             out_name = f"verify_{abs_idx:06d}.jpg"
-            cv2.imwrite(os.path.join(out_dir, out_name), blended)
+            cv_imwrite(os.path.join(out_dir, out_name), blended)
             rendered.append(blended)
             rendered_idxs.append(abs_idx)
 
@@ -1114,7 +1122,7 @@ class Annotator:
                     cv2.putText(grid, f"F{rendered_idxs[i]}", (c * thumb_w + 5, y0 + 20),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1, cv2.LINE_AA)
 
-            cv2.imwrite(os.path.join(out_dir, "verify_grid.jpg"), grid)
+            cv_imwrite(os.path.join(out_dir, "verify_grid.jpg"), grid)
 
     def export_verify_video(self, video_path=None, progress_callback=None):
         """从原始视频逐帧读取，叠加已导出的 JSON polygon，生成一个带 overlay 的验证视频。
@@ -1231,7 +1239,7 @@ class Annotator:
                 if not ret:
                     continue
                 os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
-                cv2.imwrite(target, frame)
+                cv_imwrite(target, frame)
         finally:
             cap.release()
         
@@ -1378,8 +1386,8 @@ class Annotator:
             if frame_count % interval == 0:
                 frame_path = os.path.join(self.extract_dir, f"{i:06d}.jpg")
                 self.extracted_frames.append(frame_path)
-                cv2.imwrite(frame_path, frame)
-                cv2.imwrite(os.path.join(self.sam_extract_dir, f"{i:06d}.jpg"), frame)
+                cv_imwrite(frame_path, frame)
+                cv_imwrite(os.path.join(self.sam_extract_dir, f"{i:06d}.jpg"), frame)
                 saved_count += 1
             frame_count += 1
             progress = (frame_count / (end_frame - start_frame)) * 100
@@ -1389,8 +1397,8 @@ class Annotator:
         if ret:
             frame_path = os.path.join(self.extract_dir, f"{(i+1):06d}.jpg")
             self.extra_frame_path[self.current_block] = frame_path
-            cv2.imwrite(frame_path, frame)  # 写到 extract_dir
-            cv2.imwrite(os.path.join(self.sam_extract_dir, f"{(i+1):06d}.jpg"), frame)  # 也写到 sam_extract_dir
+            cv_imwrite(frame_path, frame)  # 写到 extract_dir
+            cv_imwrite(os.path.join(self.sam_extract_dir, f"{(i+1):06d}.jpg"), frame)  # 也写到 sam_extract_dir
         else:
             self.extra_frame_path[self.current_block] = None
 
@@ -1667,6 +1675,187 @@ class Annotator:
             shape_hw = next(iter(by_key.values()))["mask"].shape
         return list(by_key.values()), shape_hw
 
+    def _scan_entry_bbox_from_mask(self, mask):
+        rows = np.flatnonzero(np.any(mask, axis=1))
+        cols = np.flatnonzero(np.any(mask, axis=0))
+        if rows.size == 0 or cols.size == 0:
+            return None
+        return (
+            int(cols[0]),
+            int(rows[0]),
+            int(cols[-1]) + 1,
+            int(rows[-1]) + 1,
+        )
+
+    def _overlap_scan_entries(self, abs_idx):
+        """Load lightweight scan entries, delaying full-size polygon masks."""
+        json_path = os.path.join(self.project_dir, "jsons", f"{abs_idx:06d}.json")
+        data = None
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = None
+
+        shape_hw = None
+        entries_by_key = {}
+        if data is not None:
+            h = int(data.get("imageHeight") or 0)
+            w = int(data.get("imageWidth") or 0)
+            if h > 0 and w > 0:
+                shape_hw = (h, w)
+                for shape in data.get("shapes", []):
+                    label_name = shape.get("label", "")
+                    group_id = shape.get("group_id", None)
+                    points = shape.get("points", [])
+                    if not points:
+                        continue
+                    try:
+                        pts = np.array(points, dtype=np.int32).reshape(-1, 1, 2)
+                    except Exception:
+                        continue
+                    if len(pts) < 3:
+                        continue
+
+                    key = self._mask_identity_key(group_id, label_name)
+                    if key not in entries_by_key:
+                        display_name, _ = self._label_meta_for_mask(label_name, group_id)
+                        entries_by_key[key] = {
+                            "key": key,
+                            "group_id": self._normalise_group_id(group_id),
+                            "label": display_name,
+                            "contours": [],
+                            "bbox": None,
+                        }
+                    entry = entries_by_key[key]
+                    entry["contours"].append(pts)
+                    x, y, width, height = cv2.boundingRect(pts)
+                    bbox = (x, y, x + width, y + height)
+                    if entry["bbox"] is None:
+                        entry["bbox"] = bbox
+                    else:
+                        left, top, right, bottom = entry["bbox"]
+                        entry["bbox"] = (
+                            min(left, bbox[0]),
+                            min(top, bbox[1]),
+                            max(right, bbox[2]),
+                            max(bottom, bbox[3]),
+                        )
+
+        # In-memory masks override JSON entries with the same identity, matching
+        # _merged_entries_for_overlap_scan.
+        memory_entries = self._mask_entries_from_memory(abs_idx, shape_hw=shape_hw)
+        if shape_hw is None and memory_entries:
+            shape_hw = memory_entries[0]["mask"].shape
+        for entry in memory_entries:
+            mask = entry["mask"]
+            copied = dict(entry)
+            copied["bbox"] = (
+                self._scan_entry_bbox_from_mask(mask)
+                if mask.shape == shape_hw else None
+            )
+            entries_by_key[entry["key"]] = copied
+
+        return list(entries_by_key.values()), shape_hw
+
+    def _rasterize_overlap_scan_entry(self, entry, shape_hw):
+        mask = entry.get("mask")
+        if mask is not None:
+            return mask
+        h, w = shape_hw
+        mask_u8 = np.zeros((h, w), dtype=np.uint8)
+        # Keep the same union semantics as _mask_entries_from_shapes.
+        for contour in entry.get("contours", []):
+            cv2.fillPoly(mask_u8, [contour], 1)
+        return mask_u8.view(bool)
+
+    def _scan_overlap_frame(self, abs_idx, min_area=1):
+        entries, shape_hw = self._overlap_scan_entries(abs_idx)
+        if len(entries) < 2 or shape_hw is None:
+            return None
+
+        active_idxs = set()
+        for idx, entry in enumerate(entries):
+            bbox = entry.get("bbox")
+            if bbox is None:
+                continue
+            left, top, right, bottom = bbox
+            for other_idx in range(idx + 1, len(entries)):
+                other_bbox = entries[other_idx].get("bbox")
+                if other_bbox is None:
+                    continue
+                other_left, other_top, other_right, other_bottom = other_bbox
+                if (left < other_right and other_left < right
+                        and top < other_bottom and other_top < bottom):
+                    active_idxs.add(idx)
+                    active_idxs.add(other_idx)
+
+        if len(active_idxs) < 2:
+            return None
+
+        h, w = shape_hw
+        covered = np.zeros((h, w), dtype=bool)
+        overlap = np.zeros((h, w), dtype=bool)
+        work = np.empty((h, w), dtype=bool)
+        active_entries = []
+        for idx in sorted(active_idxs):
+            entry = entries[idx]
+            mask = self._rasterize_overlap_scan_entry(entry, shape_hw)
+            active_entries.append((entry, mask))
+            np.logical_and(covered, mask, out=work)
+            np.logical_or(overlap, work, out=overlap)
+            np.logical_or(covered, mask, out=covered)
+
+        if not np.any(overlap):
+            return None
+
+        overlap_u8 = overlap.view(np.uint8)
+        n_labels, comp_labels, stats, _ = cv2.connectedComponentsWithStats(
+            overlap_u8,
+            connectivity=8,
+        )
+        name_counts = {}
+        for entry in entries:
+            name = entry.get("label") or ""
+            name_counts[name] = name_counts.get(name, 0) + 1
+        duplicate_names = {name for name, count in name_counts.items() if count > 1}
+
+        components = []
+        for comp_id in range(1, n_labels):
+            area = int(stats[comp_id, cv2.CC_STAT_AREA])
+            if area < min_area:
+                continue
+            x = int(stats[comp_id, cv2.CC_STAT_LEFT])
+            y = int(stats[comp_id, cv2.CC_STAT_TOP])
+            width = int(stats[comp_id, cv2.CC_STAT_WIDTH])
+            height = int(stats[comp_id, cv2.CC_STAT_HEIGHT])
+            comp_roi = comp_labels[y:y + height, x:x + width] == comp_id
+            involved = []
+            for entry, mask in active_entries:
+                if np.any(mask[y:y + height, x:x + width] & comp_roi):
+                    involved.append(self._entry_report_name(entry, duplicate_names))
+            involved = list(dict.fromkeys(involved))
+            if len(involved) < 2:
+                continue
+            components.append({
+                "area": area,
+                "bbox": (x, y, width, height),
+                "labels": involved,
+            })
+
+        if not components:
+            return None
+        labels = []
+        for component in components:
+            labels.extend(component["labels"])
+        return {
+            "frame": int(abs_idx),
+            "overlap_pixels": int(overlap_u8.sum()),
+            "components": components,
+            "labels": list(dict.fromkeys(labels)),
+        }
+
     def _overlap_lookup_signature(self, abs_idx):
         json_path = os.path.join(self.project_dir, "jsons", f"{abs_idx:06d}.json")
         json_sig = None
@@ -1755,7 +1944,8 @@ class Annotator:
             return []
         return cache.get("component_labels", {}).get(comp_id, [])
 
-    def scan_mask_overlaps(self, start_abs=None, end_abs=None, min_area=1, progress_callback=None):
+    def scan_mask_overlaps(self, start_abs=None, end_abs=None, min_area=1,
+                           progress_callback=None, max_workers=4):
         """Scan existing annotations for overlapping masks from different labels."""
         json_dir = os.path.join(self.project_dir, "jsons")
         candidate_idxs = set()
@@ -1779,29 +1969,34 @@ class Annotator:
             candidate_idxs = {idx for idx in candidate_idxs if idx <= int(end_abs)}
 
         sorted_idxs = sorted(candidate_idxs)
-        results = []
         total = len(sorted_idxs)
-        for pos, abs_idx in enumerate(sorted_idxs, start=1):
-            entries, shape_hw = self._merged_entries_for_overlap_scan(abs_idx)
-            components, overlap_pixels = self._overlap_components_from_entries(
-                entries,
-                shape_hw,
-                min_area=min_area,
-            )
-            if components:
-                labels = []
-                for comp in components:
-                    labels.extend(comp["labels"])
-                labels = list(dict.fromkeys(labels))
-                results.append({
-                    "frame": int(abs_idx),
-                    "overlap_pixels": int(overlap_pixels),
-                    "components": components,
-                    "labels": labels,
-                })
-            if progress_callback and (pos % 25 == 0 or pos == total):
-                progress_callback(pos, total)
-        return results
+        if total == 0:
+            return []
+
+        worker_count = max(1, min(int(max_workers or 1), 4, total))
+        if worker_count == 1:
+            results = []
+            for pos, abs_idx in enumerate(sorted_idxs, start=1):
+                result = self._scan_overlap_frame(abs_idx, min_area=min_area)
+                if result is not None:
+                    results.append(result)
+                if progress_callback and (pos % 25 == 0 or pos == total):
+                    progress_callback(pos, total)
+            return results
+
+        results = []
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(self._scan_overlap_frame, abs_idx, min_area): abs_idx
+                for abs_idx in sorted_idxs
+            }
+            for pos, future in enumerate(as_completed(futures), start=1):
+                result = future.result()
+                if result is not None:
+                    results.append(result)
+                if progress_callback and (pos % 25 == 0 or pos == total):
+                    progress_callback(pos, total)
+        return sorted(results, key=lambda item: int(item["frame"]))
 
     def _compose_mask_entries(self, entries, shape_hw, apply_overlap_cue=True):
         if not entries or shape_hw is None:
@@ -1888,7 +2083,10 @@ class Annotator:
             file_path = self._path_for_abs_idx(abs_idx)
             if not os.path.exists(file_path):
                 return None
-            img_rgb = cv2.cvtColor(cv2.imread(file_path), cv2.COLOR_BGR2RGB)
+            img_bgr = cv_imread(file_path)
+            if img_bgr is None:
+                return None
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
             self.curr_img_shape = img_rgb.shape
             combined, overlap_mask, _ = self._combined_mask_data(
                 abs_idx,

@@ -3,6 +3,41 @@ import os
 import pickle
 import tempfile
 
+import cv2
+import numpy as np
+
+
+def cv_imread(path, flags=cv2.IMREAD_COLOR):
+    """Read an image from paths that may contain non-ASCII characters."""
+    try:
+        encoded = np.fromfile(os.fspath(path), dtype=np.uint8)
+    except OSError:
+        return None
+    if encoded.size == 0:
+        return None
+    try:
+        return cv2.imdecode(encoded, flags)
+    except cv2.error:
+        return None
+
+
+def cv_imwrite(path, image, params=None):
+    """Write an image to paths that may contain non-ASCII characters."""
+    extension = os.path.splitext(os.fspath(path))[1]
+    if not extension:
+        return False
+    try:
+        ok, encoded = cv2.imencode(extension, image, params or [])
+    except cv2.error:
+        return False
+    if not ok:
+        return False
+    try:
+        encoded.tofile(os.fspath(path))
+    except OSError:
+        return False
+    return True
+
 
 def atomic_write_bytes(path, data):
     """Write bytes via same-directory temp file, then atomically replace target."""

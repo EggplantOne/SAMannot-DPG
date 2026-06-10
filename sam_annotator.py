@@ -9,6 +9,7 @@ from sam2.build_sam import build_sam2_video_predictor
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 import re
 import shutil
+from safe_io import cv_imread
 class SAM_Annotator:
     def __init__(self, model_type="vit_b", model_cfg_path = None, ckpt_path=None):
         self.model_loaded = False
@@ -160,7 +161,7 @@ class SAM_Annotator:
             return {}
         try:
             current_path = self.media_files[idx]
-            image = cv2.imread(current_path)
+            image = cv_imread(current_path)
             if image is None:
                 print(f"[SAM] cannot read image: {current_path}")
                 return {}

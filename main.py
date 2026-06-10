@@ -10,10 +10,11 @@ import json
 import pickle
 import subprocess
 from datetime import datetime
+from queue import Empty, SimpleQueue
 
 from annotator import Annotator
 from label import Label_Handler, PBox, PPoint
-from safe_io import atomic_json_dump, atomic_pickle_dump
+from safe_io import atomic_json_dump, atomic_pickle_dump, cv_imread, cv_imwrite
 
 # ── globals ──────────────────────────────────────────────────────────────────
 ann = Annotator()
@@ -57,9 +58,14 @@ _main_thread_id = threading.get_ident()
 _pending_progress = []            # queued (msg, pct) updates from worker threads
 _pending_session_name = None      # str or None
 _pending_busy_update = False
-_pending_overlap_results = None
+_pending_overlap_results = SimpleQueue()
 _overlap_scan_running = False
 _overlap_scan_results = []
+_overlap_review_status = {}
+_overlap_selected_frame = None
+_overlap_scan_bounds = None
+_overlap_scan_notice = None
+_overlap_scan_generation = 0
 
 LABEL_PRESETS_FILE = "label_presets.json"
 
@@ -110,7 +116,7 @@ def _get_display_image():
 
     # always read original to keep shape/size updated
     path = ann.media_files[ann.curr_img_idx]
-    img_bgr = cv2.imread(path)
+    img_bgr = cv_imread(path)
     if img_bgr is None:
         return None
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
@@ -1560,12 +1566,55 @@ class _ProgressVar:
         _show_progress(f"Extracting frames... {int(v)}%", v)
 
 
-def _do_load_media(file_path, block_size):
+def _resolve_folder_project(folder):
+    """Return (project_dir, media_dir) for a selected project or frames folder."""
+    folder = os.path.abspath(folder)
+    if os.path.basename(folder).lower() == "frames":
+        return os.path.dirname(folder), folder
+
+    frames_dir = os.path.join(folder, "frames")
+    if os.path.isdir(frames_dir):
+        return folder, frames_dir
+
+    try:
+        has_session = any(f.lower().endswith(".pkl") for f in os.listdir(folder))
+    except OSError:
+        has_session = False
+    if has_session or os.path.isdir(os.path.join(folder, "jsons")):
+        return folder, folder
+
+    # Preserve the historical behavior for plain image folders.
+    return None, folder
+
+
+def _find_project_session(project_dir):
+    if not project_dir or not os.path.isdir(project_dir):
+        return None
+    pkl_files = sorted(
+        f for f in os.listdir(project_dir)
+        if f.lower().endswith(".pkl")
+    )
+    if len(pkl_files) == 1:
+        return os.path.join(project_dir, pkl_files[0])
+
+    project_name = os.path.basename(os.path.normpath(project_dir))
+    preferred = os.path.join(project_dir, f"{project_name}.pkl")
+    return preferred if os.path.isfile(preferred) else None
+
+
+def _do_load_media(file_path, block_size, project_dir=None):
     global _loaded_file_path, _loaded_session_path, _max_frame
+    _reset_overlap_navigator(render=False)
+    if not project_dir:
+        containing_dir = file_path if os.path.isdir(file_path) else os.path.dirname(file_path)
+        if os.path.basename(os.path.normpath(containing_dir)).lower() == "frames":
+            project_dir = os.path.dirname(os.path.normpath(containing_dir))
     # 切到新项目（没有 pkl 的路径）：先清空上一个项目残留的 labels / masks /
     # tracking_results 等状态，否则旧 label 会留在 UI 里。session pkl 加载走
     # _load_session_from_path → load_from_dict，自带状态替换，不需要这一步。
     ann.reset()
+    if project_dir:
+        ann.set_project_dir(project_dir)
     _loaded_file_path = file_path
     _loaded_session_path = ""
     ann.block_size = block_size
@@ -1580,7 +1629,7 @@ def _do_load_media(file_path, block_size):
     elif is_dir:
         # folder selected: if it's named "frames", use parent dir name (= video name)
         folder_name = os.path.basename(file_path)
-        if folder_name == "frames":
+        if folder_name.lower() == "frames":
             media_basename = os.path.basename(os.path.dirname(file_path))
         else:
             media_basename = folder_name
@@ -1691,6 +1740,248 @@ def _extract_block_frames(block_idx, block_size, total):
     _show_progress(f"Extracted {n} frames.", 100)
 
 
+FILE_BROWSER_TAG = "file_browser_modal"
+FILE_BROWSER_DIR_THEME = "file_browser_dir_theme"
+FILE_BROWSER_PKL_THEME = "file_browser_pkl_theme"
+FILE_BROWSER_VIDEO_THEME = "file_browser_video_theme"
+FILE_BROWSER_IMAGE_THEME = "file_browser_image_theme"
+OVERLAP_PENDING_THEME = "overlap_pending_theme"
+OVERLAP_ACCEPTED_THEME = "overlap_accepted_theme"
+OVERLAP_RESOLVED_THEME = "overlap_resolved_theme"
+
+MEDIA_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".jpg", ".jpeg", ".png"}
+VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+
+_file_browser_state = {
+    "current_dir": "",
+    "mode": "file",
+    "extensions": set(),
+    "callback": None,
+    "selected_path": "",
+    "entry_tags": [],
+    "handler_tags": [],
+}
+
+
+def _file_browser_drives():
+    """Return available filesystem roots without invoking a native file dialog."""
+    if os.name == "nt":
+        return [
+            f"{chr(letter)}:\\"
+            for letter in range(ord("A"), ord("Z") + 1)
+            if os.path.exists(f"{chr(letter)}:\\")
+        ]
+    return [os.path.abspath(os.sep)]
+
+
+def _file_browser_entries(directory, extensions, include_files=True):
+    """Return current-directory entries only; never recursively scan."""
+    dirs = []
+    files = []
+    normalized_extensions = {ext.lower() for ext in extensions}
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            try:
+                if entry.is_dir():
+                    dirs.append(entry.path)
+                elif include_files and entry.is_file():
+                    ext = os.path.splitext(entry.name)[1].lower()
+                    if not normalized_extensions or ext in normalized_extensions:
+                        files.append(entry.path)
+            except OSError:
+                continue
+    dirs.sort(key=lambda path: os.path.basename(path).casefold())
+    files.sort(key=lambda path: os.path.basename(path).casefold())
+    return dirs, files
+
+
+def _file_browser_theme(path, is_dir):
+    if is_dir:
+        return FILE_BROWSER_DIR_THEME
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".pkl":
+        return FILE_BROWSER_PKL_THEME
+    if ext in VIDEO_EXTENSIONS:
+        return FILE_BROWSER_VIDEO_THEME
+    if ext in IMAGE_EXTENSIONS:
+        return FILE_BROWSER_IMAGE_THEME
+    return None
+
+
+def _file_browser_set_status(message, error=False):
+    if dpg.does_item_exist("file_browser_status"):
+        dpg.set_value("file_browser_status", message)
+        dpg.configure_item(
+            "file_browser_status",
+            color=(255, 110, 110) if error else (160, 190, 220),
+        )
+
+
+def _file_browser_clear_entries():
+    for tag in _file_browser_state["handler_tags"]:
+        if dpg.does_item_exist(tag):
+            dpg.delete_item(tag)
+    _file_browser_state["handler_tags"] = []
+    _file_browser_state["entry_tags"] = []
+    if dpg.does_item_exist("file_browser_entries"):
+        dpg.delete_item("file_browser_entries", children_only=True)
+
+
+def _file_browser_refresh(sender=None, app_data=None):
+    directory = _file_browser_state["current_dir"]
+    _file_browser_clear_entries()
+    _file_browser_state["selected_path"] = ""
+    dpg.set_value("file_browser_path", directory)
+
+    try:
+        dirs, files = _file_browser_entries(
+            directory,
+            _file_browser_state["extensions"],
+            include_files=(_file_browser_state["mode"] == "file"),
+        )
+    except OSError as exc:
+        _file_browser_set_status(f"Cannot open directory: {exc}", error=True)
+        return
+    for path in dirs + files:
+        is_dir = os.path.isdir(path)
+        label = f"[DIR]  {os.path.basename(path)}" if is_dir else os.path.basename(path)
+        item_tag = dpg.generate_uuid()
+        item = dpg.add_selectable(
+            label=label,
+            tag=item_tag,
+            parent="file_browser_entries",
+            callback=_cb_file_browser_select,
+            user_data=(path, is_dir),
+        )
+        theme = _file_browser_theme(path, is_dir)
+        if theme and dpg.does_item_exist(theme):
+            dpg.bind_item_theme(item, theme)
+        handler_tag = dpg.generate_uuid()
+        with dpg.item_handler_registry(tag=handler_tag):
+            dpg.add_item_double_clicked_handler(
+                button=dpg.mvMouseButton_Left,
+                callback=_cb_file_browser_double_click,
+                user_data=(path, is_dir),
+            )
+        dpg.bind_item_handler_registry(item, handler_tag)
+        _file_browser_state["entry_tags"].append(item_tag)
+        _file_browser_state["handler_tags"].append(handler_tag)
+
+    mode = _file_browser_state["mode"]
+    if mode == "folder":
+        _file_browser_set_status(f"{len(dirs)} folders. Select Current Folder to confirm.")
+    else:
+        _file_browser_set_status(f"{len(dirs)} folders, {len(files)} matching files.")
+
+
+def _file_browser_navigate(path):
+    path = os.path.abspath(os.path.expanduser(path.strip().strip('"').strip("'")))
+    if os.path.isfile(path):
+        if _file_browser_state["mode"] == "file":
+            _file_browser_accept(path)
+            return
+        path = os.path.dirname(path)
+    if not os.path.isdir(path):
+        _file_browser_set_status(f"Directory does not exist: {path}", error=True)
+        return
+    _file_browser_state["current_dir"] = path
+    drive, _ = os.path.splitdrive(path)
+    if drive and dpg.does_item_exist("file_browser_drive"):
+        dpg.set_value("file_browser_drive", drive + "\\")
+    _file_browser_refresh()
+
+
+def _file_browser_accept(path):
+    callback = _file_browser_state["callback"]
+    mode = _file_browser_state["mode"]
+    if mode == "folder":
+        if not os.path.isdir(path):
+            _file_browser_set_status("Select a folder.", error=True)
+            return
+    elif not os.path.isfile(path):
+        _file_browser_set_status("Select a file.", error=True)
+        return
+    elif _file_browser_state["extensions"]:
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in _file_browser_state["extensions"]:
+            _file_browser_set_status(f"Unsupported file type: {ext or '(none)'}", error=True)
+            return
+    _hide_modal(FILE_BROWSER_TAG)
+    if callback:
+        callback(path)
+
+
+def _cb_file_browser_select(sender, app_data, user_data):
+    path, is_dir = user_data
+    for tag in _file_browser_state["entry_tags"]:
+        if dpg.does_item_exist(tag) and tag != sender:
+            dpg.set_value(tag, False)
+    _file_browser_state["selected_path"] = path
+    kind = "Folder" if is_dir else "File"
+    _file_browser_set_status(f"{kind}: {path}")
+
+
+def _cb_file_browser_double_click(sender, app_data, user_data):
+    path, is_dir = user_data
+    if is_dir:
+        _file_browser_navigate(path)
+    elif _file_browser_state["mode"] == "file":
+        _file_browser_accept(path)
+
+
+def _cb_file_browser_open_selected(sender=None, app_data=None):
+    path = _file_browser_state["selected_path"]
+    if not path:
+        _file_browser_set_status("Select an item first.", error=True)
+        return
+    if os.path.isdir(path):
+        _file_browser_navigate(path)
+    else:
+        _file_browser_accept(path)
+
+
+def _cb_file_browser_select_current(sender=None, app_data=None):
+    _file_browser_accept(_file_browser_state["current_dir"])
+
+
+def _cb_file_browser_up(sender=None, app_data=None):
+    current = _file_browser_state["current_dir"]
+    parent = os.path.dirname(os.path.normpath(current))
+    if parent and parent != current:
+        _file_browser_navigate(parent)
+
+
+def _cb_file_browser_go(sender=None, app_data=None):
+    _file_browser_navigate(dpg.get_value("file_browser_path"))
+
+
+def _cb_file_browser_drive(sender, app_data):
+    if app_data:
+        _file_browser_navigate(app_data)
+
+
+def _open_file_browser(title, mode, extensions, callback, initial_dir=None):
+    initial_dir = initial_dir or os.getcwd()
+    if not os.path.isdir(initial_dir):
+        initial_dir = os.path.dirname(initial_dir) if os.path.isfile(initial_dir) else os.getcwd()
+    _file_browser_state.update({
+        "current_dir": os.path.abspath(initial_dir),
+        "mode": mode,
+        "extensions": {ext.lower() for ext in extensions},
+        "callback": callback,
+        "selected_path": "",
+    })
+    dpg.configure_item(FILE_BROWSER_TAG, label=title, show=True)
+    drives = _file_browser_drives()
+    dpg.configure_item("file_browser_drive", items=drives)
+    drive, _ = os.path.splitdrive(_file_browser_state["current_dir"])
+    dpg.set_value("file_browser_drive", drive + "\\" if drive else drives[0])
+    dpg.configure_item("file_browser_open", show=(mode == "file"))
+    dpg.configure_item("file_browser_select_current", show=(mode == "folder"))
+    _file_browser_refresh()
+
+
 def _on_file_selected(sender, app_data):
     """DPG file dialog callback for Load Video/Image."""
     selections = app_data.get("selections", {})
@@ -1714,19 +2005,8 @@ def _on_folder_selected(sender, app_data):
     if not folder or not os.path.isdir(folder):
         return
 
-    # 推导 project_dir，检查是否有 pkl
-    folder_name = os.path.basename(folder)
-    if folder_name == "frames":
-        media_basename = os.path.basename(os.path.dirname(folder))
-    else:
-        media_basename = folder_name
-    project_dir = os.path.join("projects", media_basename)
-
-    pkl_path = None
-    if os.path.isdir(project_dir):
-        pkl_files = [f for f in os.listdir(project_dir) if f.endswith(".pkl")]
-        if len(pkl_files) == 1:
-            pkl_path = os.path.join(project_dir, pkl_files[0])
+    project_dir, media_dir = _resolve_folder_project(folder)
+    pkl_path = _find_project_session(project_dir)
 
     if pkl_path:
         # 有 pkl → 走完整的 Load Session 流程
@@ -1736,39 +2016,29 @@ def _on_folder_selected(sender, app_data):
         block_size = int(dpg.get_value("block_size_input"))
         def do_load():
             global _media_load_done
-            _do_load_media(folder, block_size)
+            _do_load_media(media_dir, block_size, project_dir)
             _media_load_done = True
         threading.Thread(target=do_load, daemon=True).start()
 
 
 def cb_load_media(sender, app_data):
-    tag = "file_dialog_media"
-    if dpg.does_item_exist(tag):
-        dpg.delete_item(tag)
-    with dpg.file_dialog(label="Select video or image file",
-                         callback=_on_file_selected,
-                         width=800, height=500, tag=tag,
-                         default_path=os.getcwd() if os.getcwd().isascii() else os.path.expanduser("~")):
-        dpg.add_file_extension(".mp4", color=(0, 255, 0))
-        dpg.add_file_extension(".avi", color=(0, 255, 0))
-        dpg.add_file_extension(".mov", color=(0, 255, 0))
-        dpg.add_file_extension(".mkv", color=(0, 255, 0))
-        dpg.add_file_extension(".jpg", color=(0, 200, 255))
-        dpg.add_file_extension(".jpeg", color=(0, 200, 255))
-        dpg.add_file_extension(".png", color=(0, 200, 255))
-        dpg.add_file_extension(".*")
+    _open_file_browser(
+        "Select video or image file",
+        "file",
+        MEDIA_EXTENSIONS,
+        lambda path: _on_file_selected(
+            None, {"selections": {os.path.basename(path): path}}
+        ),
+    )
 
 
 def cb_load_folder(sender, app_data):
-    tag = "file_dialog_folder"
-    if dpg.does_item_exist(tag):
-        dpg.delete_item(tag)
-    with dpg.file_dialog(label="Select image folder",
-                         callback=_on_folder_selected,
-                         directory_selector=True,
-                         width=800, height=500, tag=tag,
-                         default_path=os.getcwd() if os.getcwd().isascii() else os.path.expanduser("~")):
-        pass
+    _open_file_browser(
+        "Select image folder",
+        "folder",
+        set(),
+        lambda path: _on_folder_selected(None, {"file_path_name": path}),
+    )
 
 
 def cb_block_prev(sender, app_data):
@@ -1821,9 +2091,8 @@ def cb_save_session(sender, app_data):
     if not ann.media_files:
         _show_progress("No media loaded.", 0)
         return
-    os.makedirs(ann.project_dir, exist_ok=True)
-    session_name = ann.session_name or "session"
-    path = os.path.join(ann.project_dir, f"{session_name}.pkl")
+    path = _session_save_path()
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     data = ann.compress_to_dict()
     _save_session_pickle(path, data)
     _show_progress(f"Saved: {path}", 100)
@@ -2489,6 +2758,9 @@ def _reconcile_session_group_ids():
 
 def _load_session_from_path(path):
     """Load a session pkl file. Used by both Load Session and Load Folder (when pkl found)."""
+    path = os.path.abspath(path)
+    _reset_overlap_navigator()
+
     def do_load():
         global _max_frame, _session_load_done, _loaded_session_path
         import shutil as _shutil
@@ -2504,6 +2776,9 @@ def _load_session_from_path(path):
                 return
             _show_progress("Recovered session from sidecar JSON.", 20)
         ann.load_from_dict(data)
+        # The selected pkl location is authoritative, so moved and external
+        # projects use their own frames/jsons/overlays directories.
+        ann.set_project_dir(os.path.dirname(path))
         _loaded_session_path = path
 
         _show_progress("Restoring frames...", 30)
@@ -2604,27 +2879,18 @@ def _load_session_from_path(path):
     threading.Thread(target=do_load, daemon=True).start()
 
 
-def _on_session_selected(sender, app_data):
-    """DPG file dialog callback for Load Session."""
-    selections = app_data.get("selections", {})
-    if not selections:
-        return
-    path = list(selections.values())[0]
-    _load_session_from_path(path)
-
-
 def cb_load_session(sender, app_data):
-    tag = "file_dialog_session"
-    if dpg.does_item_exist(tag):
-        dpg.delete_item(tag)
-    with dpg.file_dialog(label="Load Session",
-                         callback=_on_session_selected,
-                         width=800, height=500, tag=tag,
-                         default_path=os.path.join(os.getcwd(), "projects")):
-        dpg.add_file_extension(".pkl", color=(255, 200, 0))
+    _open_file_browser(
+        "Load Session",
+        "file",
+        {".pkl"},
+        _load_session_from_path,
+        initial_dir=os.path.join(os.getcwd(), "projects"),
+    )
 
 
 def cb_reset_session(sender, app_data):
+    _reset_overlap_navigator()
     ann.reset()
     refresh_label_listbox()
     update_prompt_list()
@@ -2679,15 +2945,6 @@ def _do_export_verify_video(video_path):
     _run_inference(task)
 
 
-def _on_verify_video_selected(sender, app_data):
-    """User picked the source video for verify video export."""
-    selections = app_data.get("selections", {})
-    if not selections:
-        return
-    video_path = list(selections.values())[0]
-    _do_export_verify_video(video_path)
-
-
 def cb_export_verify_video(sender, app_data):
     json_dir = os.path.join(ann.project_dir, "jsons")
     if not os.path.exists(json_dir) or not any(f.endswith(".json") for f in os.listdir(json_dir)):
@@ -2699,17 +2956,12 @@ def cb_export_verify_video(sender, app_data):
         video_path = getattr(ann, '_preextract_source_video', '')
     if not video_path or not os.path.exists(video_path):
         # ask user to select the source video
-        tag = "file_dialog_verify_video"
-        if dpg.does_item_exist(tag):
-            dpg.delete_item(tag)
-        with dpg.file_dialog(label="Select source video for verify video",
-                             callback=_on_verify_video_selected,
-                             width=800, height=500, tag=tag,
-                             default_path=os.getcwd() if os.getcwd().isascii() else os.path.expanduser("~")):
-            dpg.add_file_extension(".mp4", color=(0, 255, 0))
-            dpg.add_file_extension(".avi", color=(0, 255, 0))
-            dpg.add_file_extension(".mov", color=(0, 255, 0))
-            dpg.add_file_extension(".mkv", color=(0, 255, 0))
+        _open_file_browser(
+            "Select source video for verify video",
+            "file",
+            VIDEO_EXTENSIONS,
+            _do_export_verify_video,
+        )
         return
 
     _do_export_verify_video(video_path)
@@ -2841,7 +3093,7 @@ def _do_pre_extract(video_path, total_frames, out_dir, high_quality):
                 ret, frame = cap.read()
                 if not ret:
                     break
-                cv2.imwrite(os.path.join(out_dir, f"{i:06d}.jpg"), frame, jpg_quality)
+                cv_imwrite(os.path.join(out_dir, f"{i:06d}.jpg"), frame, jpg_quality)
                 if i % 50 == 0:
                     _show_progress(f"Extracting: {i}/{total_frames}",
                                    (i / total_frames) * 100)
@@ -2856,18 +3108,15 @@ def _do_pre_extract(video_path, total_frames, out_dir, high_quality):
 
 def cb_pre_extract(sender, app_data):
     """Open file dialog to select video for pre-extraction."""
-    tag = "file_dialog_preextract"
-    if dpg.does_item_exist(tag):
-        dpg.delete_item(tag)
-    with dpg.file_dialog(label="Select video to pre-extract",
-                         callback=_on_preextract_video_selected,
-                         width=800, height=500, tag=tag,
-                         default_path=os.getcwd() if os.getcwd().isascii() else os.path.expanduser("~")):
-        dpg.add_file_extension(".mp4", color=(0, 255, 0))
-        dpg.add_file_extension(".avi", color=(0, 255, 0))
-        dpg.add_file_extension(".mov", color=(0, 255, 0))
-        dpg.add_file_extension(".mkv", color=(0, 255, 0))
-        dpg.add_file_extension(".*")
+    _open_file_browser(
+        "Select video to pre-extract",
+        "file",
+        VIDEO_EXTENSIONS,
+        lambda path: _on_preextract_video_selected(
+                None,
+                {"file_path_name": path, "selections": {os.path.basename(path): path}},
+        ),
+    )
 
 
 
@@ -2998,12 +3247,15 @@ def _overlap_scan_default_bounds():
 
 
 def _prepare_overlap_scan_modal():
+    global _overlap_scan_bounds
     if not dpg.does_item_exist("overlap_start"):
         return
-    start_abs, end_abs = _overlap_scan_default_bounds()
+    if _overlap_scan_bounds is None:
+        _overlap_scan_bounds = _overlap_scan_default_bounds()
+    start_abs, end_abs = _overlap_scan_bounds
     dpg.set_value("overlap_start", int(start_abs))
     dpg.set_value("overlap_end", int(end_abs))
-    _render_overlap_scan_results(None)
+    _render_overlap_scan_results()
 
 
 def cb_overlap_scan_dialog(sender=None, app_data=None):
@@ -3018,57 +3270,162 @@ def _format_overlap_result_item(result):
     return f"{frame:06d} | {pixels} px | {regions} region(s) | {labels}"
 
 
-def _render_overlap_scan_results(payload):
-    global _overlap_scan_results, _overlap_scan_running
+def _overlap_result_frames():
+    return {int(result["frame"]) for result in _overlap_scan_results}
+
+
+def _overlap_current_result_frame():
+    frames = _overlap_result_frames()
+    if ann.media_files:
+        current = int(ann._current_abs_idx())
+        if current in frames:
+            return current
+    if _overlap_selected_frame in frames:
+        return _overlap_selected_frame
+    return None
+
+
+def _reset_overlap_navigator(render=True):
+    global _overlap_scan_running, _overlap_scan_results
+    global _overlap_review_status, _overlap_selected_frame
+    global _overlap_scan_bounds, _overlap_scan_notice, _overlap_scan_generation
+    _overlap_scan_generation += 1
+    _overlap_scan_running = False
+    _overlap_scan_results = []
+    _overlap_review_status = {}
+    _overlap_selected_frame = None
+    _overlap_scan_bounds = None
+    _overlap_scan_notice = None
+    if render and _dpg_ready and threading.get_ident() == _main_thread_id:
+        _render_overlap_scan_results()
+
+
+def _render_overlap_scan_results():
     if not dpg.does_item_exist("overlap_results_container"):
         return
     dpg.delete_item("overlap_results_container", children_only=True)
-    if payload is None:
-        _overlap_scan_results = []
-        dpg.add_text("Run a scan to list frames with overlapping masks.",
-                     color=(160, 160, 160), parent="overlap_results_container",
-                     wrap=520)
+    if _overlap_scan_notice:
+        color = (255, 90, 90) if "failed" in _overlap_scan_notice.lower() else (180, 220, 180)
+        dpg.add_text(_overlap_scan_notice, color=color,
+                     parent="overlap_results_container", wrap=680)
+    if not _overlap_scan_results:
+        if not _overlap_scan_notice:
+            message = "Scanning overlaps..." if _overlap_scan_running else (
+                "Run a scan to list frames with overlapping masks."
+            )
+            dpg.add_text(message, color=(160, 160, 160),
+                         parent="overlap_results_container", wrap=680)
+        return
+
+    counts = {
+        status: sum(1 for value in _overlap_review_status.values() if value == status)
+        for status in ("pending", "accepted", "resolved")
+    }
+    bounds = _overlap_scan_bounds or ("?", "?")
+    dpg.add_text(
+        f"{len(_overlap_scan_results)} result(s) in [{bounds[0]}, {bounds[1]}]  |  "
+        f"Pending: {counts['pending']}  Accepted: {counts['accepted']}  "
+        f"Resolved: {counts['resolved']}",
+        color=(230, 230, 230),
+        parent="overlap_results_container",
+        wrap=680,
+    )
+    theme_by_status = {
+        "pending": OVERLAP_PENDING_THEME,
+        "accepted": OVERLAP_ACCEPTED_THEME,
+        "resolved": OVERLAP_RESOLVED_THEME,
+    }
+    for result in sorted(_overlap_scan_results, key=lambda item: int(item["frame"])):
+        frame = int(result["frame"])
+        status = _overlap_review_status.get(frame, "pending")
+        selected = frame == _overlap_selected_frame
+        item = dpg.add_selectable(
+            label=f"{'>' if selected else ' '} [{status.upper()}] {_format_overlap_result_item(result)}",
+            parent="overlap_results_container",
+            callback=_cb_overlap_result_selected,
+            user_data=frame,
+            default_value=selected,
+        )
+        dpg.bind_item_theme(item, theme_by_status[status])
+
+
+def _apply_overlap_scan_payload(payload):
+    global _overlap_scan_running, _overlap_scan_results
+    global _overlap_review_status, _overlap_selected_frame
+    global _overlap_scan_bounds, _overlap_scan_notice
+    if payload.get("generation") != _overlap_scan_generation:
         return
 
     _overlap_scan_running = False
+    kind = payload.get("kind", "scan")
+    if kind == "recheck":
+        frame = int(payload["frame"])
+        if payload.get("error"):
+            _overlap_scan_notice = payload["error"]
+            _show_progress(payload["error"], 0)
+        else:
+            results = payload.get("results", [])
+            if results:
+                result = results[0]
+                _overlap_scan_results = [
+                    existing for existing in _overlap_scan_results
+                    if int(existing["frame"]) != frame
+                ]
+                _overlap_scan_results.append(result)
+                _overlap_review_status[frame] = "pending"
+                _overlap_selected_frame = frame
+                if _overlap_scan_bounds is None:
+                    _overlap_scan_bounds = (frame, frame)
+                else:
+                    _overlap_scan_bounds = (
+                        min(_overlap_scan_bounds[0], frame),
+                        max(_overlap_scan_bounds[1], frame),
+                    )
+                _overlap_scan_notice = f"Frame {frame} still has overlaps and is Pending."
+                _show_progress(_overlap_scan_notice, 100)
+            elif frame in _overlap_result_frames():
+                _overlap_review_status[frame] = "resolved"
+                _overlap_selected_frame = frame
+                _overlap_scan_notice = f"Frame {frame} no longer has overlaps and is Resolved."
+                _show_progress(_overlap_scan_notice, 100)
+            else:
+                _overlap_scan_notice = f"Frame {frame} has no overlaps."
+                _show_progress(_overlap_scan_notice, 100)
+        _render_overlap_scan_results()
+        return
+
+    _overlap_scan_bounds = (int(payload["start_abs"]), int(payload["end_abs"]))
     if payload.get("error"):
         _overlap_scan_results = []
-        dpg.add_text(payload["error"], color=(255, 90, 90),
-                     parent="overlap_results_container", wrap=520)
+        _overlap_review_status = {}
+        _overlap_selected_frame = None
+        _overlap_scan_notice = payload["error"]
         _show_progress(payload["error"], 0)
-        return
-
-    results = payload.get("results", [])
-    _overlap_scan_results = results
-    start_abs = payload.get("start_abs")
-    end_abs = payload.get("end_abs")
-    if not results:
-        dpg.add_text(f"No overlaps found in [{start_abs}, {end_abs}].",
-                     color=(180, 220, 180), parent="overlap_results_container",
-                     wrap=520)
-        _show_progress(f"No overlaps found in [{start_abs}, {end_abs}].", 100)
-        return
-
-    total_pixels = sum(int(r.get("overlap_pixels", 0)) for r in results)
-    dpg.add_text(
-        f"{len(results)} frame(s) with overlaps in [{start_abs}, {end_abs}], "
-        f"{total_pixels} overlap pixels total.",
-        color=(230, 230, 230),
-        parent="overlap_results_container",
-        wrap=520,
-    )
-    for result in results:
-        dpg.add_selectable(
-            label=_format_overlap_result_item(result),
-            parent="overlap_results_container",
-            callback=_cb_overlap_result_selected,
-            user_data=int(result["frame"]),
+    else:
+        _overlap_scan_results = sorted(
+            payload.get("results", []), key=lambda item: int(item["frame"])
         )
-    _show_progress(f"Overlap scan found {len(results)} frame(s).", 100)
+        _overlap_review_status = {
+            int(result["frame"]): "pending" for result in _overlap_scan_results
+        }
+        _overlap_selected_frame = None
+        if _overlap_scan_results:
+            _overlap_scan_notice = None
+            _show_progress(
+                f"Overlap scan found {len(_overlap_scan_results)} frame(s).", 100
+            )
+        else:
+            _overlap_scan_notice = (
+                f"No overlaps found in [{_overlap_scan_bounds[0]}, {_overlap_scan_bounds[1]}]."
+            )
+            _show_progress(_overlap_scan_notice, 100)
+    _render_overlap_scan_results()
 
 
 def _start_overlap_scan(start_abs, end_abs):
-    global _overlap_scan_running
+    global _overlap_scan_running, _overlap_scan_results
+    global _overlap_review_status, _overlap_selected_frame
+    global _overlap_scan_bounds, _overlap_scan_notice, _overlap_scan_generation
     if _overlap_scan_running:
         _show_progress("Overlap scan already running.", 0)
         return
@@ -3076,16 +3433,18 @@ def _start_overlap_scan(start_abs, end_abs):
         _show_progress("Start frame must be <= end frame.", 0)
         return
 
+    _overlap_scan_generation += 1
+    generation = _overlap_scan_generation
     _overlap_scan_running = True
-    if dpg.does_item_exist("overlap_results_container"):
-        dpg.delete_item("overlap_results_container", children_only=True)
-        dpg.add_text("Scanning overlaps...",
-                     color=(180, 180, 180),
-                     parent="overlap_results_container")
+    _overlap_scan_results = []
+    _overlap_review_status = {}
+    _overlap_selected_frame = None
+    _overlap_scan_bounds = (int(start_abs), int(end_abs))
+    _overlap_scan_notice = "Scanning overlaps..."
+    _render_overlap_scan_results()
     _show_progress(f"Scanning overlaps [{start_abs}, {end_abs}]...", 0)
 
     def task():
-        global _pending_overlap_results
         try:
             def progress(done, total):
                 pct = int(done / max(1, total) * 100)
@@ -3096,19 +3455,23 @@ def _start_overlap_scan(start_abs, end_abs):
                 end_abs=end_abs,
                 progress_callback=progress,
             )
-            _pending_overlap_results = {
+            _pending_overlap_results.put({
+                "kind": "scan",
+                "generation": generation,
                 "start_abs": int(start_abs),
                 "end_abs": int(end_abs),
                 "results": results,
-            }
+            })
         except Exception as e:
             import traceback
             traceback.print_exc()
-            _pending_overlap_results = {
+            _pending_overlap_results.put({
+                "kind": "scan",
+                "generation": generation,
                 "start_abs": int(start_abs),
                 "end_abs": int(end_abs),
                 "error": f"Overlap scan failed: {e}",
-            }
+            })
 
     threading.Thread(target=task, daemon=True).start()
 
@@ -3129,11 +3492,102 @@ def _cb_overlap_scan_all(sender=None, app_data=None):
 
 
 def _cb_overlap_result_selected(sender, app_data, user_data):
+    global _overlap_selected_frame
     frame = int(user_data)
-    _hide_modal("overlap_scan_modal")
+    _overlap_selected_frame = frame
     ann.view_mode = "overlay"
     if _jump_to_abs_frame(frame, view_mode="overlay"):
         _show_progress(f"Jumped to overlap frame {frame}.", 100)
+    _render_overlap_scan_results()
+
+
+def _jump_to_pending_overlap(direction):
+    pending = sorted(
+        frame for frame, status in _overlap_review_status.items()
+        if status == "pending"
+    )
+    if not pending:
+        _show_progress("No Pending overlap results.", 100)
+        return
+    current = ann._current_abs_idx() if ann.media_files else _overlap_selected_frame
+    if current is None:
+        target = pending[0] if direction > 0 else pending[-1]
+    elif direction > 0:
+        target = next((frame for frame in pending if frame > current), None)
+    else:
+        target = next((frame for frame in reversed(pending) if frame < current), None)
+    if target is None:
+        edge = "next" if direction > 0 else "previous"
+        _show_progress(f"No {edge} Pending overlap result.", 100)
+        return
+    _cb_overlap_result_selected(None, None, target)
+
+
+def _cb_overlap_previous_pending(sender=None, app_data=None):
+    _jump_to_pending_overlap(-1)
+
+
+def _cb_overlap_next_pending(sender=None, app_data=None):
+    _jump_to_pending_overlap(1)
+
+
+def _set_current_overlap_status(status):
+    global _overlap_scan_notice
+    frame = _overlap_current_result_frame()
+    if frame is None:
+        _show_progress("Current frame is not in the overlap results.", 0)
+        return
+    _overlap_review_status[frame] = status
+    label = "Accepted" if status == "accepted" else "Pending"
+    _overlap_scan_notice = f"Frame {frame} marked {label}."
+    _render_overlap_scan_results()
+    _show_progress(_overlap_scan_notice, 100)
+
+
+def _cb_overlap_accept_current(sender=None, app_data=None):
+    _set_current_overlap_status("accepted")
+
+
+def _cb_overlap_reset_current(sender=None, app_data=None):
+    _set_current_overlap_status("pending")
+
+
+def _cb_overlap_recheck_current(sender=None, app_data=None):
+    global _overlap_scan_running, _overlap_scan_notice
+    if _overlap_scan_running:
+        _show_progress("Overlap scan already running.", 0)
+        return
+    if not ann.media_files:
+        _show_progress("Load media before rechecking overlaps.", 0)
+        return
+
+    frame = int(ann._current_abs_idx())
+    generation = _overlap_scan_generation
+    _overlap_scan_running = True
+    _overlap_scan_notice = f"Rechecking frame {frame}..."
+    _render_overlap_scan_results()
+    _show_progress(_overlap_scan_notice, 0)
+
+    def task():
+        try:
+            results = ann.scan_mask_overlaps(start_abs=frame, end_abs=frame)
+            _pending_overlap_results.put({
+                "kind": "recheck",
+                "generation": generation,
+                "frame": frame,
+                "results": results,
+            })
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            _pending_overlap_results.put({
+                "kind": "recheck",
+                "generation": generation,
+                "frame": frame,
+                "error": f"Overlap recheck failed: {e}",
+            })
+
+    threading.Thread(target=task, daemon=True).start()
 
 
 def _show_modal(tag):
@@ -3265,8 +3719,81 @@ def _cb_reconcile_apply(sender, app_data):
     threading.Thread(target=task, daemon=True).start()
 
 
+def _build_file_browser_themes():
+    themes = [
+        (FILE_BROWSER_DIR_THEME, (170, 210, 255)),
+        (FILE_BROWSER_PKL_THEME, (255, 205, 70)),
+        (FILE_BROWSER_VIDEO_THEME, (100, 230, 130)),
+        (FILE_BROWSER_IMAGE_THEME, (80, 200, 255)),
+        (OVERLAP_PENDING_THEME, (255, 205, 70)),
+        (OVERLAP_ACCEPTED_THEME, (100, 230, 130)),
+        (OVERLAP_RESOLVED_THEME, (150, 150, 150)),
+    ]
+    for tag, color in themes:
+        with dpg.theme(tag=tag):
+            with dpg.theme_component(dpg.mvSelectable):
+                dpg.add_theme_color(
+                    dpg.mvThemeCol_Text,
+                    color,
+                    category=dpg.mvThemeCat_Core,
+                )
+
+
 def _build_modal_dialogs():
     """Create modal dialog windows (hidden by default)."""
+    # Python-backed file browser. It uses standard DPG controls but avoids
+    # dpg.file_dialog, whose native C++ path handling can crash on Windows
+    # when navigating non-ASCII directories.
+    with dpg.window(label="File Browser", tag=FILE_BROWSER_TAG,
+                    modal=True, show=False, width=850, height=600, no_resize=True):
+        with dpg.group(horizontal=True):
+            dpg.add_combo(
+                tag="file_browser_drive",
+                items=_file_browser_drives(),
+                width=85,
+                callback=_cb_file_browser_drive,
+            )
+            dpg.add_input_text(
+                tag="file_browser_path",
+                width=650,
+                on_enter=True,
+                callback=_cb_file_browser_go,
+            )
+            dpg.add_button(label="Go", callback=_cb_file_browser_go, width=55)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Up", callback=_cb_file_browser_up, width=80)
+            dpg.add_button(label="Refresh", callback=_file_browser_refresh, width=90)
+            dpg.add_text(
+                "Double-click a folder to enter it or a matching file to open it.",
+                color=(150, 170, 190),
+            )
+        dpg.add_child_window(
+            tag="file_browser_entries",
+            width=-1,
+            height=440,
+            border=True,
+        )
+        dpg.add_text("", tag="file_browser_status", color=(160, 190, 220))
+        with dpg.group(horizontal=True):
+            dpg.add_button(
+                label="Open",
+                tag="file_browser_open",
+                callback=_cb_file_browser_open_selected,
+                width=130,
+            )
+            dpg.add_button(
+                label="Select Current Folder",
+                tag="file_browser_select_current",
+                callback=_cb_file_browser_select_current,
+                width=190,
+                show=False,
+            )
+            dpg.add_button(
+                label="Cancel",
+                callback=lambda: _hide_modal(FILE_BROWSER_TAG),
+                width=100,
+            )
+
     # Pre-extract path dialog
     with dpg.window(label="Pre-extract from path", tag="preextract_modal",
                     modal=True, show=False, width=500, height=100, no_resize=True):
@@ -3286,11 +3813,11 @@ def _build_modal_dialogs():
             dpg.add_button(label="Go", callback=_cb_goto_frame_apply, width=100)
             dpg.add_button(label="Cancel", callback=lambda: (_hide_modal("goto_frame_modal"), dpg.focus_item("primary_window")), width=100)
 
-    # Overlap scan dialog
-    with dpg.window(label="Check Mask Overlaps", tag="overlap_scan_modal",
-                    modal=True, show=False, width=620, height=430, no_resize=True):
+    # Persistent, non-modal overlap review navigator.
+    with dpg.window(label="Overlap Navigator", tag="overlap_scan_modal",
+                    modal=False, show=False, width=760, height=520):
         dpg.add_text("Scan existing JSON and in-memory masks for different labels covering the same pixels.",
-                     wrap=590)
+                     wrap=720)
         with dpg.group(horizontal=True):
             dpg.add_text("Frames:")
             dpg.add_input_int(tag="overlap_start", default_value=0, width=110,
@@ -3302,11 +3829,19 @@ def _build_modal_dialogs():
             dpg.add_button(label="Scan Range", callback=_cb_overlap_scan_range, width=120)
             dpg.add_button(label="Whole Video", callback=_cb_overlap_scan_all, width=120)
             dpg.add_button(label="Close", callback=lambda: _hide_modal("overlap_scan_modal"), width=100)
+        with dpg.group(horizontal=True):
+            dpg.add_button(label="Previous Pending", callback=_cb_overlap_previous_pending, width=135)
+            dpg.add_button(label="Next Pending", callback=_cb_overlap_next_pending, width=120)
+            dpg.add_button(label="Accept Current", callback=_cb_overlap_accept_current, width=125)
+            dpg.add_button(label="Reset to Pending", callback=_cb_overlap_reset_current, width=135)
+            dpg.add_button(label="Recheck Current Frame", callback=_cb_overlap_recheck_current, width=160)
+        dpg.add_text("Accepted means the overlap is intentional. Resolved means a recheck found no overlap.",
+                     color=(170, 170, 170), wrap=720)
         dpg.add_separator()
         with dpg.child_window(tag="overlap_results_container",
-                              width=-1, height=285, border=True):
+                              width=-1, height=-1, border=True):
             dpg.add_text("Run a scan to list frames with overlapping masks.",
-                         color=(160, 160, 160), wrap=560)
+                         color=(160, 160, 160), wrap=700)
 
     # Reassign label dialog
     with dpg.window(label="Reassign Label", tag="reassign_modal",
@@ -3427,6 +3962,7 @@ def build_ui():
     dpg.create_viewport(title="SAMannot-DPG", width=1536, height=860)
 
     _setup_font()
+    _build_file_browser_themes()
 
     tex_w = DISPLAY_W
     tex_h = DISPLAY_H
@@ -3584,11 +4120,13 @@ def build_ui():
                 dpg.set_value("progress_text", pp[0])
             except Exception:
                 pass
-        if _pending_overlap_results is not None:
-            por = _pending_overlap_results
-            _pending_overlap_results = None
+        try:
+            por = _pending_overlap_results.get_nowait()
+        except Empty:
+            por = None
+        if por is not None:
             try:
-                _render_overlap_scan_results(por)
+                _apply_overlap_scan_payload(por)
             except Exception as e:
                 print(f"overlap results render error: {e}")
         psn = _pending_session_name
@@ -3602,6 +4140,7 @@ def build_ui():
             _media_load_done = False
             refresh_label_listbox()
             load_and_show_frame()
+            _render_overlap_scan_results()
         if _session_load_done:
             _session_load_done = False
             try:
@@ -3611,6 +4150,7 @@ def build_ui():
             refresh_label_listbox()
             _sync_mask_alpha_slider()
             load_and_show_frame()
+            _render_overlap_scan_results()
             _show_progress(f"Session loaded: {ann.session_name} "
                            f"({len(ann.media_files)} frames)", 100)
         if ann.view_mode in ("overlay", "masks"):
