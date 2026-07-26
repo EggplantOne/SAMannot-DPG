@@ -1517,7 +1517,10 @@ class Annotator:
         return display_name, self.hex_to_rgb("#ffffff")
 
     def _mask_entries_from_memory(self, abs_idx, shape_hw=None):
-        frame_masks = self.masks.get(abs_idx, {})
+        # Inference writes masks in a worker while the GUI may render them on
+        # the main thread.  Iterate over a shallow snapshot to avoid observing
+        # a dict resize mid-render.
+        frame_masks = dict(self.masks.get(abs_idx, {}))
         entries = []
         for group_id, mask in frame_masks.items():
             mask_arr = np.asarray(mask, dtype=bool)
@@ -1866,7 +1869,7 @@ class Annotator:
             except OSError:
                 json_sig = None
         mem_sig = []
-        for group_id, mask in self.masks.get(abs_idx, {}).items():
+        for group_id, mask in dict(self.masks.get(abs_idx, {})).items():
             mem_sig.append((group_id, getattr(mask, "shape", None), id(mask)))
         return (abs_idx, json_sig, tuple(sorted(mem_sig, key=lambda x: str(x[0]))))
 
@@ -1957,7 +1960,7 @@ class Annotator:
                     candidate_idxs.add(int(os.path.splitext(fname)[0]))
                 except ValueError:
                     continue
-        for key in self.masks.keys():
+        for key in list(self.masks):
             try:
                 candidate_idxs.add(int(key))
             except (TypeError, ValueError):

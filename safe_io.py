@@ -2,6 +2,7 @@ import json
 import os
 import pickle
 import tempfile
+import time
 
 import cv2
 import numpy as np
@@ -53,7 +54,17 @@ def atomic_write_bytes(path, data):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, path)
+        # Windows may transiently hold the destination open (Explorer preview,
+        # antivirus, or a synchronisation client).  Retrying preserves the
+        # atomic replace guarantee without risking a partial JSON file.
+        for attempt in range(8):
+            try:
+                os.replace(tmp_path, path)
+                break
+            except PermissionError:
+                if attempt == 7:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
     except Exception:
         try:
             os.remove(tmp_path)

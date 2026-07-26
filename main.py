@@ -59,6 +59,9 @@ _pending_progress = []            # queued (msg, pct) updates from worker thread
 _pending_session_name = None      # str or None
 _pending_busy_update = False
 _pending_overlap_results = SimpleQueue()
+_pending_frame_refresh = False
+_pending_timeline_refresh = False
+_pending_toast_clear = False
 _overlap_scan_running = False
 _overlap_scan_results = []
 _overlap_review_status = {}
@@ -147,7 +150,10 @@ def _get_display_image():
 
 
 def load_and_show_frame():
-    global tex_data
+    global tex_data, _pending_frame_refresh
+    if threading.get_ident() != _main_thread_id:
+        _pending_frame_refresh = True
+        return
     img_rgb = _get_display_image()
     if img_rgb is None:
         return
@@ -205,6 +211,10 @@ def _update_frame_slider():
 
 def _draw_timeline():
     """Draw timeline: mask=blue, propagated=cyan, prompt=green, checkpoint=red, current=white."""
+    global _pending_timeline_refresh
+    if threading.get_ident() != _main_thread_id:
+        _pending_timeline_refresh = True
+        return
     if not _dpg_ready or not dpg.does_item_exist("timeline_drawlist"):
         return
     try:
@@ -401,11 +411,8 @@ def show_label_toast():
         return
 
     def _clear():
-        try:
-            if dpg.does_item_exist(TOAST_NODE):
-                dpg.delete_item(TOAST_NODE)
-        except Exception:
-            pass
+        global _pending_toast_clear
+        _pending_toast_clear = True
 
     if _toast_timer is not None:
         try:
@@ -418,7 +425,11 @@ def show_label_toast():
 
 
 def draw_overlays():
+    global _pending_frame_refresh
     if not _dpg_ready:
+        return
+    if threading.get_ident() != _main_thread_id:
+        _pending_frame_refresh = True
         return
     # only clear the overlay node, never touch the base draw_image
     try:
@@ -974,15 +985,16 @@ def cb_single(sender, app_data):
     if not ann.has_prompts(ann.current_block):
         _show_progress("No prompts on this block. Click on the image to add points.", 0)
         return
+    single_label_mode = _is_single_label_mode()
+    selected_gid = ann.sam_handler.labels[ann.curr_label_idx].group_id if single_label_mode else None
 
     def task():
         _show_progress("Generating mask...", 10)
         success, prop_frames = ann.generate_mask()
         if success:
             _show_progress("Applying masks...", 50)
-            if _is_single_label_mode():
+            if single_label_mode:
                 # Only keep the selected label's result, merge into existing JSON
-                selected_gid = ann.sam_handler.labels[ann.curr_label_idx].group_id
                 for fidx in list(ann.tracking_results.keys()):
                     ann.tracking_results[fidx] = {
                         gid: m for gid, m in ann.tracking_results[fidx].items()
@@ -1047,15 +1059,19 @@ def _is_single_label_mode():
 def cb_forward(sender, app_data):
     if not _check_inference_ready():
         return
+    single_label_mode = _is_single_label_mode()
+    selected_label = None
+    if single_label_mode:
+        if ann.curr_label_idx < 0:
+            _show_progress("No label selected.", 0)
+            return
+        selected_label = ann.sam_handler.labels[ann.curr_label_idx]
     def task():
         if not _init_tracking_if_needed():
             return
-        if _is_single_label_mode():
-            if ann.curr_label_idx < 0:
-                _show_progress("No label selected.", 0); return
-            label = ann.sam_handler.labels[ann.curr_label_idx]
-            _show_progress(f"Forward '{label.name}'...", 10)
-            success, frames = ann.propagate_single_label(label.group_id, 1, _progress_callback)
+        if single_label_mode:
+            _show_progress(f"Forward '{selected_label.name}'...", 10)
+            success, frames = ann.propagate_single_label(selected_label.group_id, 1, _progress_callback)
             merge = True
         else:
             _show_progress("Propagating forward...", 10)
@@ -1075,15 +1091,19 @@ def cb_forward(sender, app_data):
 def cb_backward(sender, app_data):
     if not _check_inference_ready():
         return
+    single_label_mode = _is_single_label_mode()
+    selected_label = None
+    if single_label_mode:
+        if ann.curr_label_idx < 0:
+            _show_progress("No label selected.", 0)
+            return
+        selected_label = ann.sam_handler.labels[ann.curr_label_idx]
     def task():
         if not _init_tracking_if_needed():
             return
-        if _is_single_label_mode():
-            if ann.curr_label_idx < 0:
-                _show_progress("No label selected.", 0); return
-            label = ann.sam_handler.labels[ann.curr_label_idx]
-            _show_progress(f"Backward '{label.name}'...", 10)
-            success, frames = ann.propagate_single_label(label.group_id, -1, _progress_callback)
+        if single_label_mode:
+            _show_progress(f"Backward '{selected_label.name}'...", 10)
+            success, frames = ann.propagate_single_label(selected_label.group_id, -1, _progress_callback)
             merge = True
         else:
             _show_progress("Propagating backward...", 10)
@@ -1103,15 +1123,19 @@ def cb_backward(sender, app_data):
 def cb_all(sender, app_data):
     if not _check_inference_ready():
         return
+    single_label_mode = _is_single_label_mode()
+    selected_label = None
+    if single_label_mode:
+        if ann.curr_label_idx < 0:
+            _show_progress("No label selected.", 0)
+            return
+        selected_label = ann.sam_handler.labels[ann.curr_label_idx]
     def task():
         if not _init_tracking_if_needed():
             return
-        if _is_single_label_mode():
-            if ann.curr_label_idx < 0:
-                _show_progress("No label selected.", 0); return
-            label = ann.sam_handler.labels[ann.curr_label_idx]
-            _show_progress(f"All '{label.name}'...", 10)
-            success, frames = ann.propagate_single_label(label.group_id, 0, _progress_callback)
+        if single_label_mode:
+            _show_progress(f"All '{selected_label.name}'...", 10)
+            success, frames = ann.propagate_single_label(selected_label.group_id, 0, _progress_callback)
             merge = True
         else:
             _show_progress("Propagating all...", 10)
@@ -4107,6 +4131,7 @@ def build_ui():
         global _session_load_done, _media_load_done
         global _pending_progress, _pending_session_name, _pending_busy_update
         global _pending_overlap_results
+        global _pending_frame_refresh, _pending_timeline_refresh, _pending_toast_clear
         # flush thread-safe UI updates
         if _pending_busy_update:
             _pending_busy_update = False
@@ -4120,6 +4145,19 @@ def build_ui():
                 dpg.set_value("progress_text", pp[0])
             except Exception:
                 pass
+        if _pending_toast_clear:
+            _pending_toast_clear = False
+            try:
+                if dpg.does_item_exist(TOAST_NODE):
+                    dpg.delete_item(TOAST_NODE)
+            except Exception:
+                pass
+        if _pending_frame_refresh:
+            _pending_frame_refresh = False
+            load_and_show_frame()
+        if _pending_timeline_refresh:
+            _pending_timeline_refresh = False
+            _draw_timeline()
         try:
             por = _pending_overlap_results.get_nowait()
         except Empty:
