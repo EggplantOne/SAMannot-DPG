@@ -56,6 +56,7 @@ _media_load_done = False
 # Thread-safe UI update queue (DPG is NOT thread-safe)
 _main_thread_id = threading.get_ident()
 _pending_progress = []            # queued (msg, pct) updates from worker threads
+_pending_model_status_update = False
 _pending_session_name = None      # str or None
 _pending_busy_update = False
 _pending_overlap_results = SimpleQueue()
@@ -881,6 +882,43 @@ def _show_progress(msg, pct=0):
         pass
 
 
+def _loaded_model_display_name():
+    """Return the configured model name without exposing a missing value to the UI."""
+    cfg_path = os.path.basename(ann.sam_handler.model_cfg_path or "")
+    ckpt_path = os.path.basename(ann.sam_handler.ckpt_path or "")
+    for name, (cfg, ckpt) in MODEL_OPTIONS.items():
+        if cfg_path == os.path.basename(cfg) or ckpt_path == os.path.basename(ckpt):
+            return name
+    return ""
+
+
+def _refresh_model_status():
+    """Refresh the persistent SAM2 status on the DearPyGui main thread."""
+    global _pending_model_status_update
+    if not _dpg_ready:
+        return
+    if threading.get_ident() != _main_thread_id:
+        _pending_model_status_update = True
+        return
+    if not dpg.does_item_exist("model_status_text"):
+        return
+
+    if ann.sam_handler.model_loading:
+        name = _loaded_model_display_name()
+        text = f"SAM2 {name} loading..." if name else "SAM2 loading..."
+        color = (235, 190, 80)
+    elif ann.model_status():
+        name = _loaded_model_display_name()
+        text = f"SAM2 {name} loaded" if name else "SAM2 loaded"
+        color = (100, 220, 140)
+    else:
+        text = "SAM2 not loaded"
+        color = (190, 190, 190)
+
+    dpg.set_value("model_status_text", text)
+    dpg.configure_item("model_status_text", color=color)
+
+
 def _progress_callback(msg, pct=0):
     _show_progress(msg, pct)
 
@@ -1259,6 +1297,7 @@ def cb_load_model(sender, app_data):
             ann.sam_handler.model_loaded = False
             ann.sam_handler.model_loading = False
             ann.sam_handler.current_stage = 0
+            _refresh_model_status()
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -1266,7 +1305,11 @@ def cb_load_model(sender, app_data):
         ann.sam_handler.model_cfg_path = cfg
         ann.sam_handler.ckpt_path = ckpt_path
         _show_progress(f"Loading SAM2 {model_name}...", 10)
-        ok = ann.load_model(lambda msg: _show_progress(msg, 50))
+        def on_load_status(msg):
+            _show_progress(msg, 50)
+            _refresh_model_status()
+        ok = ann.load_model(on_load_status)
+        _refresh_model_status()
         if ok:
             _show_progress(f"SAM2 {model_name} loaded.", 100)
             print(f"[SAM2] {model_name} loaded", flush=True)
@@ -4066,6 +4109,7 @@ def build_ui():
                                      default_value=False)
                     dpg.add_button(label="Checkpoint", callback=cb_toggle_checkpoint,
                                    tag="btn_checkpoint", width=-1)
+                    dpg.add_text("SAM2 not loaded", tag="model_status_text")
                     dpg.add_text("", tag="progress_text", wrap=PANEL_W - 30)
                     dpg.add_progress_bar(tag="progress_bar", default_value=0, width=-1)
 
@@ -4126,10 +4170,12 @@ def build_ui():
 
     global _dpg_ready
     _dpg_ready = True
+    _refresh_model_status()
 
     while dpg.is_dearpygui_running():
         global _session_load_done, _media_load_done
-        global _pending_progress, _pending_session_name, _pending_busy_update
+        global _pending_progress, _pending_model_status_update
+        global _pending_session_name, _pending_busy_update
         global _pending_overlap_results
         global _pending_frame_refresh, _pending_timeline_refresh, _pending_toast_clear
         # flush thread-safe UI updates
@@ -4145,6 +4191,9 @@ def build_ui():
                 dpg.set_value("progress_text", pp[0])
             except Exception:
                 pass
+        if _pending_model_status_update:
+            _pending_model_status_update = False
+            _refresh_model_status()
         if _pending_toast_clear:
             _pending_toast_clear = False
             try:
@@ -4186,6 +4235,7 @@ def build_ui():
             except Exception:
                 pass
             refresh_label_listbox()
+            _refresh_model_status()
             _sync_mask_alpha_slider()
             load_and_show_frame()
             _render_overlap_scan_results()

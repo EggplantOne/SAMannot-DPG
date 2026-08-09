@@ -24,7 +24,8 @@
 - **Reconcile Labels**: 修复旧版 pkl 中 label 已有 `group_id` 属性但值为 `None` 时无法被正确迁移的问题。现在 Reconcile 会同时解析 JSON 里的 `group_id=null` 和 pkl label 的 `group_id=None`：同名 JSON 后续已有数字 `group_id` 时优先沿用该值；同名器械全为 `None` 时才按 pkl label 顺序分配新实例 ID；已有数字 `group_id` 的正常项目保持不变。
 - **Reconcile Labels**: `group_id=None` 不再进入 gid 去重、`max()`、`sorted()` 和 remap 计算，避免旧 pkl 在 reconcile 过程中触发类型错误或把多个 label 误判成同一个实例。
 - Fixed SAM2 mask over-expansion on Intel XPU by disabling autocast for XPU inference paths. XPU now runs SAM2 in float32 while CUDA keeps AMP enabled, avoiding the positive-logit drift that made masks cover most of the frame.
-- Fixed `Load Model` menu callbacks by passing the model name through DearPyGui `user_data` instead of relying on a lambda closure.
+- Fixed `Load Model` menu callbacks by passing the model name through DearPyGui `user_data`. The old three-argument lambda allowed DearPyGui's `None` user data to overwrite the captured model name, so the Large fallback loaded successfully while the UI reported `SAM2 None loaded`.
+- Added a persistent SAM2 status below Checkpoint. It is refreshed on the DearPyGui main thread and derives the loaded model name from the active config/checkpoint; unknown names display `SAM2 loaded` instead of exposing `None`.
 - Moved inference busy/progress UI updates back onto the DearPyGui main thread to avoid missing progress updates and native UI crashes from worker-thread DPG calls.
 
 ### Changed
