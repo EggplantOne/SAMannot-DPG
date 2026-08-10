@@ -1311,7 +1311,7 @@ def cb_load_model(sender, app_data):
         ok = ann.load_model(on_load_status)
         _refresh_model_status()
         if ok:
-            _show_progress(f"SAM2 {model_name} loaded.", 100)
+            _show_progress("", 100)
             print(f"[SAM2] {model_name} loaded", flush=True)
         else:
             _show_progress(f"Failed to load {model_name}.", 0)
@@ -3946,16 +3946,12 @@ def _build_modal_dialogs():
 
     # Reconcile Labels dialog
     with dpg.window(label="Reconcile Labels", tag="reconcile_modal",
-                    modal=True, show=False, width=450, height=250, no_resize=True):
-        dpg.add_text("Scan all JSON annotation files and fix group_id\n"
-                     "mismatches between pkl session and JSON data.\n\n"
-                     "Use this when masks appear white after loading\n"
-                     "a session (group_id inconsistency).\n\n"
-                     "IMPORTANT: Delete any incorrectly annotated JSON\n"
-                     "files BEFORE running this (e.g. blocks annotated\n"
-                     "after a wrong Load Folder), otherwise the tool\n"
-                     "cannot distinguish errors from multi-instance labels.",
-                     wrap=430)
+                    modal=True, show=False, width=420, height=205, no_resize=True):
+        dpg.add_text("修复会话与 JSON 中不一致的实例 ID（group_id）。\n"
+                     "适用于加载后遮罩变白或同名实例混乱。\n\n"
+                     "运行前请删除确认标错的 JSON，否则错误标注\n"
+                     "可能被当作有效实例保留。",
+                     wrap=400)
         dpg.add_separator()
         with dpg.group(horizontal=True):
             dpg.add_text("Block Size:")
@@ -3967,7 +3963,7 @@ def _build_modal_dialogs():
 
     # Settings dialog
     with dpg.window(label="Settings", tag="settings_modal",
-                    modal=True, show=False, width=300, height=180, no_resize=True):
+                    modal=True, show=False, width=300, height=205, no_resize=True):
         dpg.add_text("Session Name:")
         dpg.add_input_text(tag="session_name_input", default_value="Session",
                            width=-1, callback=cb_session_name)
@@ -3976,6 +3972,8 @@ def _build_modal_dialogs():
         dpg.add_input_int(tag="block_size_input", default_value=200, width=-1,
                           min_value=10, max_value=10000, min_clamped=True,
                           max_clamped=True)
+        dpg.add_text("仅在加载新项目前生效；不会修改当前项目。",
+                     color=(150, 150, 150), wrap=280)
         dpg.add_spacer(height=5)
         dpg.add_button(label="Close", callback=lambda: _hide_modal("settings_modal"), width=-1)
 
